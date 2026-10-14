@@ -7,14 +7,14 @@ conflate them:
 
 | Identity | Used for | Why this identity |
 | --- | --- | --- |
-| `omnigent <noreply@omnigent.ai>` | Co-author trailer on commits authored by **polly's coding sub-agents** | These commits are produced by `git commit` in a worker's local worktree — they are **not** GitHub Actions runs, so a plain org co-author is the honest attribution. No GitHub App user is involved. |
+| _(none)_ | Commits authored by **polly's coding sub-agents** | These commits are produced by `git commit` in a worker's local worktree and carry the user's git identity only — workers add no agent attribution (no co-author trailer). No GitHub App user is involved. |
 | `omnigent-ci[bot]` (GitHub App) | **CI automation**: lockfile-regen commits/PRs **and** automated PR-review comments | These actions genuinely run inside GitHub Actions, where the App's private key lives and a short-lived installation token is minted per run. The App is an org-owned, least-privilege identity. |
 
 > **Why two identities and not one?** An earlier draft of this work tried to use
 > `omnigent-ci[bot]` everywhere, including the sub-agent commit trailer. That was
 > corrected: polly's workers don't run in Actions and never touch the App key, so
 > attributing their commits to the Actions-minted bot user was misleading. Local
-> work → plain org co-author; Actions-minted work → the App bot.
+> work → no agent attribution; Actions-minted work → the App bot.
 
 ---
 
@@ -100,26 +100,16 @@ In **`omnigent-ai/omnigent` → Settings → Secrets and variables → Actions**
 
 ## In-repo wiring (shipped)
 
-### Sub-agent commit co-author trailer
+### Sub-agent commits carry no agent attribution
 
-polly never commits directly; its coding sub-agents (`claude_code`, `codex`,
-`pi`) run `git commit` / `gh pr create` in their own worktrees. Each such commit
-ends with a co-author trailer attributing it to the org:
+polly never commits directly; its coding sub-agents run `git commit` /
+`gh pr create` in their own worktrees. Workers add **no** agent attribution:
+no `Co-authored-by` trailer in commits and no "Generated with" line in PRs.
+Commits carry the user's git identity only.
 
-```
-Co-authored-by: omnigent <noreply@omnigent.ai>
-```
-
-This requirement lives in the worker IMPLEMENT instructions:
-
-- `examples/polly/agents/claude_code/config.yaml`
-- `examples/polly/agents/codex/config.yaml`
-- `examples/polly/agents/pi/config.yaml`
-
-> A `Co-authored-by` trailer is GitHub's lightweight attribution mechanism — it
-> attributes the commit to the org in addition to the worker author and needs no
-> signing key. It is **not** cryptographic signing (GPG/sigstore), which is a
-> separate, heavier concern.
+This rule lives in the worker IMPLEMENT instructions
+(`examples/polly/agents/*/config.yaml`) and in polly's
+`examples/polly/skills/fanout/SKILL.md`.
 
 > The packaged copies under `omnigent/resources/examples/polly/...` are a
 > **symlink** to the `examples/polly/...` source, so there is a single source of
@@ -184,7 +174,7 @@ token and posts the review **as `omnigent-ci[bot]`**:
 
 | Surface | Identity on the artifact | Where it's wired |
 | --- | --- | --- |
-| polly sub-agent commits | `omnigent <noreply@omnigent.ai>` (co-author trailer) | `examples/polly/agents/*/config.yaml` |
+| polly sub-agent commits | user's git identity only (no agent attribution) | `examples/polly/agents/*/config.yaml` |
 | Lockfile-regen commits/PRs | `omnigent-ci[bot]` | `oss-regenerate-and-smoke.yml`, `oss-regen-on-comment.yml` |
 | Automated PR review comments | `omnigent-ci[bot]` (fallback `github-actions[bot]`) | `polly-review.yml` |
 
