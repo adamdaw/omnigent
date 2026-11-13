@@ -538,8 +538,9 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         codex/cursor/kimi bypass flags, opt-out for codex/cursor and
         opt-in for kimi) and ``"permission_mode"`` (exact-match string;
         ``bypassPermissions`` maps to the claude-native /
-        antigravity-native skip flags) into the session's
-        ``terminal_launch_args``.
+        antigravity-native skip flags; a codex-native mode such as
+        ``approve-for-me`` maps to that mode's launch args) into the
+        session's ``terminal_launch_args``.
 
         🚨 **TECH DEBT — REMOVE WHEN OMNIGENT COMPAT ENDS.**
         This field exists *solely* to carry harness / profile /
@@ -890,6 +891,8 @@ class ToolGroupsConfig:
     :param comments: ``list_comments`` and ``update_comment``.
     :param policies: ``sys_add_policy`` and ``sys_policy_registry``.
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
+    :param projects: ``sys_project_list``, ``sys_project_update`` and
+        ``sys_session_update``.
     """
 
     browser: bool = True
@@ -897,6 +900,7 @@ class ToolGroupsConfig:
     comments: bool = True
     policies: bool = True
     agent_discovery: bool = True
+    projects: bool = True
 
 
 @dataclass
@@ -1654,3 +1658,14 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
+
+    @property
+    def loads_user_settings(self) -> bool:
+        """Whether a claude-sdk run loads the user's Claude settings and user-scope MCP servers.
+
+        ``skills_filter: "none"`` runs the CLI with ``setting_sources=[]``, so only
+        managed (enterprise) servers load; every other filter keeps the user source.
+
+        :returns: ``False`` only for ``skills_filter == "none"``.
+        """
+        return self.skills_filter != "none"
