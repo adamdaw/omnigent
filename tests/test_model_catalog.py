@@ -3488,3 +3488,139 @@ def test_pi_endpoint_probe_counts_any_http_response_as_up() -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def _serve_raw(chunks: list[bytes], interval: float) -> tuple[str, object]:
+    """Serve every connection *chunks*, one per *interval*, then the last chunk forever.
+
+    :param chunks: Byte chunks to write in order; the last repeats until closed.
+    :param interval: Seconds between writes.
+    :returns: The ``http://127.0.0.1:<port>/v1`` base URL and a ``stop`` callable.
+    """
+    import socket
+    import threading
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    stopped = threading.Event()
+
+    def _trickle(conn: socket.socket) -> None:
+        with conn:
+            index = 0
+            while not stopped.is_set():
+                try:
+                    conn.sendall(chunks[min(index, len(chunks) - 1)])
+                except OSError:
+                    return
+                index += 1
+                stopped.wait(interval)
+
+    def _accept() -> None:
+        while not stopped.is_set():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=_trickle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=_accept, daemon=True).start()
+
+    def _stop() -> None:
+        stopped.set()
+        listener.close()
+
+    return f"http://127.0.0.1:{listener.getsockname()[1]}/v1", _stop
+
+
+def _write_pi_providers(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    providers: dict[str, dict[str, object]],
+    settings: dict[str, object] | None = None,
+) -> None:
+    """Write a Pi agent dir declaring exactly *providers* (keyed, so all are usable).
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param root: Directory to use as Pi's agent dir.
+    :param providers: ``models.json`` providers; ``apiKey`` is added to each.
+    :param settings: ``settings.json`` contents, or ``None`` to omit the file.
+    """
+    root.mkdir(exist_ok=True)
+    declared = {name: {"apiKey": "unused", **payload} for name, payload in providers.items()}
+    (root / "models.json").write_text(json.dumps({"providers": declared}))
+    if settings is not None:
+        (root / "settings.json").write_text(json.dumps(settings))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(root))
+
+
+def test_pi_endpoint_round_drops_trickling_endpoint_within_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A server trickling its response head defeats per-read timeouts, not the round deadline."""
+    trickle_url, stop = _serve_raw([b"H", b"T", b"T", b"P"], interval=0.2)
+    healthy_url, stop_healthy = _serve_raw([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"], 5)
+    _write_pi_providers(
+        monkeypatch,
+        tmp_path / "pi",
+        {
+            "primary": {"baseUrl": trickle_url, "models": [{"id": "qwen"}]},
+            "fallback": {"baseUrl": healthy_url, "models": [{"id": "qwen"}]},
+        },
+        {"defaultProvider": "primary"},
+    )
+    try:
+        started = time.monotonic()
+        listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+        elapsed = time.monotonic() - started
+    finally:
+        stop()
+        stop_healthy()
+
+    assert _listed_ids(listing) == ["fallback/qwen"]
+    assert elapsed < model_catalog._PI_PROBE_DEADLINE_S + 1.0
+
+
+def test_pi_endpoint_probe_reads_only_the_response_head() -> None:
+    """An endpoint that answers then trickles its body is up, without waiting for the body."""
+    url, stop = _serve_raw(
+        [b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n", b"x"], interval=0.2
+    )
+    try:
+        started = time.monotonic()
+        assert model_catalog._pi_endpoint_up(url)
+        assert time.monotonic() - started < model_catalog._PI_ENDPOINT_TIMEOUT_S
+    finally:
+        stop()
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        pytest.param("http://primary.example.com:abc/v1", id="invalid-url"),
+        pytest.param("http://" + "a" * 64 + ".example.com/v1", id="unencodable-host"),
+        pytest.param("ftp://primary.example.com/v1", id="unsupported-protocol"),
+    ],
+)
+def test_pi_subscription_malformed_base_url_drops_only_that_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_url: str
+) -> None:
+    """A malformed default-provider URL drops that provider; the healthy fallback stays."""
+    healthy_url, stop = _serve_raw([b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"], 5)
+    _write_pi_providers(
+        monkeypatch,
+        tmp_path / "pi",
+        {
+            "primary": {"baseUrl": bad_url, "models": [{"id": "qwen"}]},
+            "fallback": {"baseUrl": healthy_url, "models": [{"id": "qwen"}]},
+        },
+        {"defaultProvider": "primary"},
+    )
+    try:
+        listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+    finally:
+        stop()
+
+    assert listing.source == "cli"
+    assert _listed_ids(listing) == ["fallback/qwen"]
+

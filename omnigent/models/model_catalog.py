@@ -37,7 +37,7 @@ import os
 import re
 import subprocess
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 from urllib.parse import urlsplit
@@ -1484,6 +1484,8 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
 _PI_ENDPOINT_TTL_S = 30.0
 #: Per-phase (connect, read) budget for one Pi endpoint probe.
 _PI_ENDPOINT_TIMEOUT_S = 1.0
+#: Hard wall-clock budget for a cold probe round, all providers together.
+_PI_PROBE_DEADLINE_S = 1.5
 _pi_endpoint_up_cache: TTLCache[str, bool] = TTLCache(maxsize=64, ttl=_PI_ENDPOINT_TTL_S)
 _pi_endpoint_up_lock = threading.Lock()
 
@@ -1491,11 +1493,13 @@ _pi_endpoint_up_lock = threading.Lock()
 def _pi_endpoint_up(base_url: str) -> bool:
     """Report whether an OpenAI-compatible endpoint answers ``GET {base_url}/models``.
 
-    Any HTTP response counts: the server is up even when it rejects the request.
+    Any response head counts (the body is never read): the server is up even
+    when it rejects the request. A malformed or unsupported URL counts as down.
     """
     try:
-        httpx.get(f"{base_url.rstrip('/')}/models", timeout=_PI_ENDPOINT_TIMEOUT_S)
-    except httpx.HTTPError:
+        with httpx.stream("GET", f"{base_url.rstrip('/')}/models", timeout=_PI_ENDPOINT_TIMEOUT_S):
+            pass
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
         return False
     return True
 
@@ -1503,16 +1507,30 @@ def _pi_endpoint_up(base_url: str) -> bool:
 def _pi_live_endpoints(base_urls: set[str]) -> set[str]:
     """Return the reachable subset of *base_urls*, probing uncached ones concurrently.
 
-    Concurrent probes bound a cold call to one probe's budget (~2 s worst case),
-    inside the server's 5 s catalog limit; results are cached for
-    :data:`_PI_ENDPOINT_TTL_S`.
+    httpx timeouts are per network operation, so each probe runs on a daemon
+    thread and the round waits at most :data:`_PI_PROBE_DEADLINE_S` in total;
+    an overdue probe counts as down and is not waited for. Results are cached
+    for :data:`_PI_ENDPOINT_TTL_S`.
     """
     with _pi_endpoint_up_lock:
         known = {url: _pi_endpoint_up_cache.get(url) for url in base_urls}
     unknown = [url for url, up in known.items() if up is None]
     if unknown:
-        with ThreadPoolExecutor(max_workers=len(unknown)) as pool:
-            probed = dict(zip(unknown, pool.map(_pi_endpoint_up, unknown), strict=True))
+        answered: dict[str, bool] = {}
+
+        def _probe(url: str) -> None:
+            answered[url] = _pi_endpoint_up(url)
+
+        threads = [
+            threading.Thread(target=_probe, args=(url,), name="pi-endpoint-probe", daemon=True)
+            for url in unknown
+        ]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + _PI_PROBE_DEADLINE_S
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        probed = {url: answered.get(url, False) for url in unknown}
         with _pi_endpoint_up_lock:
             _pi_endpoint_up_cache.update(probed)
         known.update(probed)
