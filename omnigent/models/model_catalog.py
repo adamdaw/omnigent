@@ -183,6 +183,9 @@ _DEVIN_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 # SDK harnesses whose CLI-login launch shares a native model-probe catalog.
 _SDK_PROBE_CLI: dict[str, str] = {"claude-sdk": "claude", "claude_sdk": "claude", "codex": "codex"}
 
+# Native harnesses whose subscription launch runs the same CLI login the probe ran.
+_NATIVE_PROBE_CLI: dict[str, str] = {"claude-native": "claude", "codex-native": "codex"}
+
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
@@ -1591,11 +1594,12 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
 def _cli_login_probe_listing(
     spec: object, harness: str, provider: ResolvedModelProvider
 ) -> ModelListing | None:
-    """Replay the native probe catalog for a CLI-login Claude or Codex SDK worker.
+    """Replay the native probe catalog for a CLI-login Claude or Codex worker.
 
     Subscription and unconfigured SDK workers launch the CLI on its own login,
     which exposes no listing API; the host caches its native probe of that launch.
-    Native workers are skipped: their launches add routes this readout cannot see.
+    Native workers count only on a subscription: other native launches add
+    routes (brokers, adopted config providers) this readout cannot see.
 
     :param spec: The worker's (sub-)agent spec.
     :param harness: The worker's harness id, e.g. ``"claude-sdk"``.
@@ -1603,7 +1607,10 @@ def _cli_login_probe_listing(
     :returns: A probe-backed listing, or ``None`` when the worker does not
         launch on a usable CLI login or its catalog is not cached.
     """
-    cli = _SDK_PROBE_CLI.get(canonicalize_harness(harness) or harness)
+    canonical = canonicalize_harness(harness) or harness
+    cli = _SDK_PROBE_CLI.get(canonical)
+    if cli is None and provider.kind == SUBSCRIPTION_KIND:
+        cli = _NATIVE_PROBE_CLI.get(canonical)
     if cli is None:
         return None
     if provider.kind == SUBSCRIPTION_KIND:

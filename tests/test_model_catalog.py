@@ -1619,16 +1619,20 @@ def test_cli_login_rows_replay_native_probe_catalogs(
     catalog = catalog_for_spec(_cli_login_parent())
 
     expected = {"self": _CLI_LOGIN_CLAUDE_IDS, "codex": _CLI_LOGIN_CODEX_IDS}
+    if subscribed:
+        # A subscription native launch runs the same CLI login the probe ran.
+        expected |= {"claude_code": _CLI_LOGIN_CLAUDE_IDS, "codex_native": _CLI_LOGIN_CODEX_IDS}
     for name, model_ids in expected.items():
         row = catalog[name]
         assert row["source"] == "cli"
         assert row["verified"] is True
         assert [model["id"] for model in row["models"]] == model_ids
         assert "cannot run here" not in str(row["note"])
-    # Native launches add routes (brokers, adopted config providers) this readout cannot see.
-    for name in ("claude_code", "codex_native"):
-        assert catalog[name]["source"] == ("static" if subscribed else "none")
-        assert catalog[name]["models"] == []
+    # Other native launches add routes (brokers, adopted config providers) this readout cannot see.
+    if not subscribed:
+        for name in ("claude_code", "codex_native"):
+            assert catalog[name]["source"] == "none"
+            assert catalog[name]["models"] == []
     # The listing reads the catalog; provider resolution (and dispatch) is unchanged.
     for harness in ("claude-sdk", "codex"):
         assert resolve_model_provider(_worker_spec(harness), harness).kind == provider_kind
