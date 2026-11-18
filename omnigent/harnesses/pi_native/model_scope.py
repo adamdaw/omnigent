@@ -17,6 +17,9 @@ from omnigent.harness_startup_config import resolve_harness_path
 
 _LOGGER = logging.getLogger(__name__)
 
+#: Default budget for one run of Pi's resolver subprocess.
+SCOPE_RESOLVER_TIMEOUT_S = 3.0
+
 
 @dataclass(frozen=True)
 class ScopableModel:
@@ -32,11 +35,17 @@ class ScopableModel:
         return f"{self.provider}/{self.model_id}"
 
 
-def scope_models(patterns: Iterable[str], models: Sequence[ScopableModel]) -> list[ScopableModel]:
+def scope_models(
+    patterns: Iterable[str],
+    models: Sequence[ScopableModel],
+    *,
+    timeout: float = SCOPE_RESOLVER_TIMEOUT_S,
+) -> list[ScopableModel]:
     """Use Pi's resolver without loading user extensions or accessing providers.
 
     :param patterns: Pi's enabledModels settings.
     :param models: Available catalog entries, in Pi's discovery order.
+    :param timeout: Seconds the resolver subprocess may run.
     :returns: Selected entries, or an empty scope when unmatched/unavailable.
         Callers retain Pi's full-catalog fallback for an empty scope.
     """
@@ -57,6 +66,7 @@ def scope_models(patterns: Iterable[str], models: Sequence[ScopableModel]) -> li
             resolver.stat().st_mtime_ns,
             tuple(patterns),
             tuple(models),
+            timeout,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         # Never include subprocess output: CLI diagnostics can contain local config.
@@ -72,6 +82,7 @@ def _scoped_indices(
     _resolver_mtime_ns: int,
     patterns: tuple[str, ...],
     models: tuple[ScopableModel, ...],
+    timeout: float,
 ) -> tuple[int, ...]:
     """Cache successful resolutions by CLI revision, settings and catalog.
 
@@ -80,6 +91,7 @@ def _scoped_indices(
     :param _resolver_mtime_ns: Invalidates cached results after an in-place CLI upgrade.
     :param patterns: Model selection patterns.
     :param models: Credential-free catalog entries.
+    :param timeout: Seconds the resolver subprocess may run.
     :returns: Validated indices into the supplied catalog.
     :raises ValueError: If the helper's output does not identify catalog entries.
     """
@@ -101,7 +113,7 @@ def _scoped_indices(
         ),
         capture_output=True,
         text=True,
-        timeout=3,
+        timeout=timeout,
         check=True,
     )
     indices = json.loads(result.stdout)

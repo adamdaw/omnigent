@@ -853,7 +853,9 @@ def test_resolve_prefers_pi_own_login_for_served_reference(
         monkeypatch.setattr(
             creds,
             "scope_models",
-            lambda patterns, entries: [creds.ScopableModel(provider_id, "picker-model")],
+            lambda patterns, entries, **_options: [
+                creds.ScopableModel(provider_id, "picker-model")
+            ],
         )
         assert [o["id"] for o in creds.pi_own_login_model_options(tmp_path)] == [alternative]
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
@@ -3962,7 +3964,9 @@ def test_pi_own_login_options_apply_scope_or_keep_catalog(
         )
     )
     (tmp_path / "settings.json").write_text(json.dumps({"enabledModels": patterns}))
-    resolver = Mock(side_effect=lambda _patterns, models: models[:1] if selected else [])
+    resolver = Mock(
+        side_effect=lambda _patterns, models, **_options: models[:1] if selected else []
+    )
     monkeypatch.setattr(creds, "scope_models", resolver)
     options = creds.pi_own_login_model_options(agent_dir=tmp_path)
     expected = [

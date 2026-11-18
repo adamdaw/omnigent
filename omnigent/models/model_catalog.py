@@ -35,6 +35,8 @@ import json
 import logging
 import os
 import re
+import socket
+import ssl
 import subprocess
 import threading
 import time
@@ -1482,58 +1484,129 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
 
 #: How long a Pi provider endpoint's reachability is reused; short so a recovered host returns.
 _PI_ENDPOINT_TTL_S = 30.0
-#: Per-phase (connect, read) budget for one Pi endpoint probe.
-_PI_ENDPOINT_TIMEOUT_S = 1.0
-#: Hard wall-clock budget for a cold probe round, all providers together.
+#: Whole Pi catalog generation (resolver + probes), under the server's 5 s catalog limit.
+_PI_LISTING_BUDGET_S = 4.0
+#: Pi's ``enabledModels`` resolver subprocess, the first step of that budget.
+_PI_RESOLVER_TIMEOUT_S = 2.0
+#: One probe round, all providers together; also each probe's own lifetime.
 _PI_PROBE_DEADLINE_S = 1.5
+#: Read at most this much of a response looking for its status line.
+_PI_PROBE_HEAD_LIMIT = 1024
 _pi_endpoint_up_cache: TTLCache[str, bool] = TTLCache(maxsize=64, ttl=_PI_ENDPOINT_TTL_S)
 _pi_endpoint_up_lock = threading.Lock()
 
 
-def _pi_endpoint_up(base_url: str) -> bool:
-    """Report whether an OpenAI-compatible endpoint answers ``GET {base_url}/models``.
+@dataclass
+class _PiProbe:
+    """One in-flight endpoint probe that later callers wait on instead of re-probing."""
 
-    Any response head counts (the body is never read): the server is up even
-    when it rejects the request. A malformed or unsupported URL counts as down.
+    done: threading.Event = field(default_factory=threading.Event)
+    up: bool = False
+
+
+#: base URL -> its running probe; at most one probe per URL exists at a time.
+_pi_probes_in_flight: dict[str, _PiProbe] = {}
+
+
+def _pi_time_left(deadline: float) -> float:
+    """Seconds until *deadline*, raising :class:`TimeoutError` once it has passed."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("Pi endpoint probe deadline passed")
+    return left
+
+
+def _pi_endpoint_up(base_url: str, deadline: float | None = None) -> bool:
+    """Report whether an HTTP(S) endpoint answers ``GET {base_url}/models`` by *deadline*.
+
+    Any status line counts (the rest is never read): the server is up even when
+    it rejects the request. Every blocking step gets only the time left, so a
+    server trickling bytes cannot hold the probe past *deadline*; only name
+    resolution is bounded by the OS resolver instead. Malformed or non-HTTP URLs
+    count as down.
+
+    :param base_url: The provider's ``baseUrl``, e.g. ``"http://host:8080/v1"``.
+    :param deadline: Absolute :func:`time.monotonic` cut-off; defaults to
+        :data:`_PI_PROBE_DEADLINE_S` from now.
+    :returns: ``True`` when a status line arrived in time.
     """
+    if deadline is None:
+        deadline = time.monotonic() + _PI_PROBE_DEADLINE_S
     try:
-        with httpx.stream("GET", f"{base_url.rstrip('/')}/models", timeout=_PI_ENDPOINT_TIMEOUT_S):
-            pass
-    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        target = urlsplit(f"{base_url.rstrip('/')}/models")
+        if target.scheme not in ("http", "https") or not target.hostname:
+            return False
+        port = target.port or (443 if target.scheme == "https" else 80)
+        request = (
+            f"GET {target.path} HTTP/1.1\r\nHost: {target.netloc.rpartition('@')[2]}\r\n"
+            "Accept: application/json\r\nConnection: close\r\n\r\n"
+        ).encode()
+        with socket.create_connection(
+            (target.hostname, port), timeout=_pi_time_left(deadline)
+        ) as raw:
+            raw.settimeout(_pi_time_left(deadline))
+            with (
+                ssl.create_default_context().wrap_socket(raw, server_hostname=target.hostname)
+                if target.scheme == "https"
+                else raw
+            ) as conn:
+                conn.settimeout(_pi_time_left(deadline))
+                conn.sendall(request)
+                head = b""
+                while b"\n" not in head and len(head) < _PI_PROBE_HEAD_LIMIT:
+                    conn.settimeout(_pi_time_left(deadline))
+                    chunk = conn.recv(_PI_PROBE_HEAD_LIMIT)
+                    if not chunk:
+                        break
+                    head += chunk
+    except (OSError, ValueError):
         return False
-    return True
+    return head.startswith(b"HTTP/") and b"\n" in head
 
 
-def _pi_live_endpoints(base_urls: set[str]) -> set[str]:
-    """Return the reachable subset of *base_urls*, probing uncached ones concurrently.
+def _pi_start_probe(base_url: str, deadline: float) -> _PiProbe:
+    """Start probing *base_url* on a daemon thread; call with the lock held.
 
-    httpx timeouts are per network operation, so each probe runs on a daemon
-    thread and the round waits at most :data:`_PI_PROBE_DEADLINE_S` in total;
-    an overdue probe counts as down and is not waited for. Results are cached
-    for :data:`_PI_ENDPOINT_TTL_S`.
+    The probe records its answer in the cache and leaves the in-flight table
+    when it finishes, which :func:`_pi_endpoint_up` guarantees by *deadline*.
     """
+    probe = _PiProbe()
+
+    def _run() -> None:
+        up = False
+        try:
+            up = _pi_endpoint_up(base_url, deadline)
+        finally:
+            with _pi_endpoint_up_lock:
+                probe.up = up
+                _pi_endpoint_up_cache[base_url] = up
+                _pi_probes_in_flight.pop(base_url, None)
+            probe.done.set()
+
+    threading.Thread(target=_run, name=f"pi-endpoint-probe {base_url}", daemon=True).start()
+    return probe
+
+
+def _pi_live_endpoints(base_urls: set[str], deadline: float) -> set[str]:
+    """Return the reachable subset of *base_urls*, answering by *deadline*.
+
+    Uncached URLs are probed concurrently, one probe per URL at a time: a caller
+    arriving while a URL's probe runs waits on that probe rather than starting
+    another. A probe not finished by *deadline* counts as down for this caller.
+    Answers are cached for :data:`_PI_ENDPOINT_TTL_S`.
+    """
+    waiting: dict[str, _PiProbe] = {}
     with _pi_endpoint_up_lock:
         known = {url: _pi_endpoint_up_cache.get(url) for url in base_urls}
-    unknown = [url for url, up in known.items() if up is None]
-    if unknown:
-        answered: dict[str, bool] = {}
-
-        def _probe(url: str) -> None:
-            answered[url] = _pi_endpoint_up(url)
-
-        threads = [
-            threading.Thread(target=_probe, args=(url,), name="pi-endpoint-probe", daemon=True)
-            for url in unknown
-        ]
-        for thread in threads:
-            thread.start()
-        deadline = time.monotonic() + _PI_PROBE_DEADLINE_S
-        for thread in threads:
-            thread.join(max(0.0, deadline - time.monotonic()))
-        probed = {url: answered.get(url, False) for url in unknown}
-        with _pi_endpoint_up_lock:
-            _pi_endpoint_up_cache.update(probed)
-        known.update(probed)
+        for url, up in known.items():
+            if up is None:
+                probe = _pi_probes_in_flight.get(url)
+                if probe is None:
+                    probe = _pi_probes_in_flight[url] = _pi_start_probe(url, deadline)
+                waiting[url] = probe
+    for url, probe in waiting.items():
+        finished = probe.done.wait(max(0.0, deadline - time.monotonic()))
+        known[url] = finished and probe.up
     return {url for url, up in known.items() if up}
 
 
@@ -1542,14 +1615,20 @@ def _pi_own_login_listing() -> ModelListing | None:
 
     Providers whose ``baseUrl`` does not answer are dropped, so routing falls
     through to the next provider (``pollux/*`` down -> ``llamaswap/*`` first).
+    The whole call (Pi's resolver, then the probes) stays within
+    :data:`_PI_LISTING_BUDGET_S`.
 
     :returns: A ``source="cli"`` listing, or ``None`` when Pi declares no
         reachable models (the caller keeps the empty pre-launch listing).
     """
     from omnigent.harnesses.pi_native.credentials import pi_own_login_routing_models
 
-    entries, base_urls = pi_own_login_routing_models()
-    live = _pi_live_endpoints({base_urls[e.provider] for e in entries if e.provider in base_urls})
+    deadline = time.monotonic() + _PI_LISTING_BUDGET_S
+    entries, base_urls = pi_own_login_routing_models(resolver_timeout_s=_PI_RESOLVER_TIMEOUT_S)
+    live = _pi_live_endpoints(
+        {base_urls[e.provider] for e in entries if e.provider in base_urls},
+        min(deadline, time.monotonic() + _PI_PROBE_DEADLINE_S),
+    )
     ids = [
         entry.reference
         for entry in entries

@@ -3315,7 +3315,7 @@ def _pi_endpoints(monkeypatch: pytest.MonkeyPatch, down: set[str]) -> list[str]:
     """
     probed: list[str] = []
 
-    def _probe(base_url: str) -> bool:
+    def _probe(base_url: str, _deadline: float | None = None) -> bool:
         probed.append(base_url)
         return base_url not in down
 
@@ -3362,7 +3362,7 @@ def test_pi_subscription_respects_enabled_models_order(
     monkeypatch.setattr(
         credentials,
         "scope_models",
-        lambda pats, models: [m for p in pats for m in models if m.reference == p],
+        lambda pats, models, **_options: [m for p in pats for m in models if m.reference == p],
     )
 
     listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
@@ -3394,7 +3394,7 @@ def test_pi_subscription_probes_endpoints_concurrently(
     _write_pi_agent_dir(monkeypatch, tmp_path / "pi", None)
     barrier = threading.Barrier(2, timeout=5)
 
-    def _probe(_base_url: str) -> bool:
+    def _probe(_base_url: str, _deadline: float | None = None) -> bool:
         barrier.wait()
         return True
 
@@ -3490,11 +3490,14 @@ def test_pi_endpoint_probe_counts_any_http_response_as_up() -> None:
         server.server_close()
 
 
-def _serve_raw(chunks: list[bytes], interval: float) -> tuple[str, object]:
+def _serve_raw(
+    chunks: list[bytes], interval: float, live: set[object] | None = None
+) -> tuple[str, object]:
     """Serve every connection *chunks*, one per *interval*, then the last chunk forever.
 
     :param chunks: Byte chunks to write in order; the last repeats until closed.
     :param interval: Seconds between writes.
+    :param live: Optional set holding each connection while the client keeps it open.
     :returns: The ``http://127.0.0.1:<port>/v1`` base URL and a ``stop`` callable.
     """
     import socket
@@ -3506,15 +3509,19 @@ def _serve_raw(chunks: list[bytes], interval: float) -> tuple[str, object]:
     stopped = threading.Event()
 
     def _trickle(conn: socket.socket) -> None:
+        if live is not None:
+            live.add(conn)
         with conn:
             index = 0
             while not stopped.is_set():
                 try:
                     conn.sendall(chunks[min(index, len(chunks) - 1)])
                 except OSError:
-                    return
+                    break
                 index += 1
                 stopped.wait(interval)
+        if live is not None:
+            live.discard(conn)
 
     def _accept() -> None:
         while not stopped.is_set():
@@ -3582,16 +3589,35 @@ def test_pi_endpoint_round_drops_trickling_endpoint_within_deadline(
 
 
 def test_pi_endpoint_probe_reads_only_the_response_head() -> None:
-    """An endpoint that answers then trickles its body is up, without waiting for the body."""
-    url, stop = _serve_raw(
-        [b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n", b"x"], interval=0.2
+    """An endpoint that answers then withholds its body is up before the body is released."""
+    import socket
+    import threading
+
+    release = threading.Event()
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+
+    def _serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+            release.wait(10)
+
+    threading.Thread(target=_serve, daemon=True).start()
+    answered: list[bool] = []
+    url = f"http://127.0.0.1:{listener.getsockname()[1]}/v1"
+    probe = threading.Thread(
+        target=lambda: answered.append(model_catalog._pi_endpoint_up(url, time.monotonic() + 10))
     )
     try:
-        started = time.monotonic()
-        assert model_catalog._pi_endpoint_up(url)
-        assert time.monotonic() - started < model_catalog._PI_ENDPOINT_TIMEOUT_S
+        probe.start()
+        probe.join(10)
+        assert answered == [True]
+        assert not release.is_set()
     finally:
-        stop()
+        release.set()
+        listener.close()
 
 
 @pytest.mark.parametrize(
@@ -3657,7 +3683,7 @@ def test_pi_subscription_unmatched_enabled_models_lists_full_inventory(
 
     _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"enabledModels": ["nomatch/*"]})
     _pi_endpoints(monkeypatch, down=set())
-    monkeypatch.setattr(credentials, "scope_models", lambda _patterns, _models: [])
+    monkeypatch.setattr(credentials, "scope_models", lambda _patterns, _models, **_options: [])
 
     listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
 
@@ -3724,7 +3750,7 @@ def test_pi_endpoint_probe_cache_expires_after_ttl(
     down = {_PI_PRIMARY_URL}
     probed: list[str] = []
 
-    def _probe(base_url: str) -> bool:
+    def _probe(base_url: str, _deadline: float | None = None) -> bool:
         probed.append(base_url)
         return base_url not in down
 
@@ -3763,3 +3789,112 @@ def test_pi_subscription_concurrent_cold_listings_agree(
 
     assert results == [["fallback/small", "fallback/large"]] * 4
     assert 2 <= len(probed) <= 8
+
+
+def _live_probe_threads(base_url: str) -> int:
+    """Count running probe threads for *base_url*."""
+    import threading
+
+    return sum(1 for t in threading.enumerate() if t.name == f"pi-endpoint-probe {base_url}")
+
+
+def test_pi_endpoint_probes_stay_bounded_against_trickling_endpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cache expiries and concurrent cold calls keep at most one probe and one connection per URL.
+
+    Each probe also closes its connection at its own deadline, so both drop to zero.
+    """
+    from concurrent.futures import ThreadPoolExecutor, wait
+
+    monkeypatch.setattr(model_catalog, "_PI_PROBE_DEADLINE_S", 0.3)
+    now = {"t": 1000.0}
+    monkeypatch.setattr(
+        model_catalog,
+        "_pi_endpoint_up_cache",
+        TTLCache(maxsize=64, ttl=model_catalog._PI_ENDPOINT_TTL_S, timer=lambda: now["t"]),
+    )
+    connections: set[object] = set()
+    url, stop = _serve_raw([b"H"], interval=0.02, live=connections)
+    _write_pi_providers(
+        monkeypatch, tmp_path / "pi", {"primary": {"baseUrl": url, "models": [{"id": "qwen"}]}}
+    )
+    peak_threads = peak_connections = 0
+
+    def _settle() -> tuple[int, int]:
+        # The server notices a closed connection only on its next write.
+        settled = time.monotonic() + 5
+        while (_live_probe_threads(url) or connections) and time.monotonic() < settled:
+            wait([], timeout=0.02)
+        return _live_probe_threads(url), len(connections)
+
+    try:
+        for _expiry in range(3):
+            now["t"] += model_catalog._PI_ENDPOINT_TTL_S + 1
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                calls = [
+                    pool.submit(model_catalog.listing_for_provider, _PI_SUBSCRIPTION)
+                    for _ in range(4)
+                ]
+                while wait(calls, timeout=0.01).not_done:
+                    peak_threads = max(peak_threads, _live_probe_threads(url))
+                    peak_connections = max(peak_connections, len(connections))
+            assert all(call.result().models == () for call in calls)
+            # Each probe closes its connection at its own deadline: nothing stays open.
+            assert _settle() == (0, 0)
+    finally:
+        stop()
+
+    assert peak_threads == 1
+    assert peak_connections <= 1
+
+
+def test_pi_listing_shares_one_deadline_across_resolver_and_probes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A slow ``enabledModels`` resolver eats into the probes' time, not the listing budget."""
+    import shutil
+
+    from omnigent.harnesses.pi_native import model_scope
+
+    if shutil.which("node") is None:
+        pytest.skip("needs Node to run the stand-in Pi resolver")
+    _isolate_config(monkeypatch, tmp_path, "")
+    # A stand-in Pi install whose resolver blocks far past its subprocess timeout.
+    dist = tmp_path / "pi-cli" / "dist"
+    (dist / "core").mkdir(parents=True)
+    (dist / "cli.js").write_text("")
+    (dist / "cli.js").chmod(0o755)
+    (dist / "core" / "model-resolver.js").write_text(
+        "export function resolveModelScopeFromModels() {\n"
+        "  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000);\n"
+        "}\n"
+    )
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "pi").symlink_to(dist / "cli.js")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+    model_scope._scoped_indices.cache_clear()
+    budget = model_catalog._PI_RESOLVER_TIMEOUT_S + 0.5
+    monkeypatch.setattr(model_catalog, "_PI_LISTING_BUDGET_S", budget)
+    trickle_url, stop = _serve_raw([b"H"], interval=0.02)
+    healthy_url, stop_healthy = _serve_raw([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"], 5)
+    _write_pi_providers(
+        monkeypatch,
+        tmp_path / "pi",
+        {
+            "primary": {"baseUrl": trickle_url, "models": [{"id": "qwen"}]},
+            "fallback": {"baseUrl": healthy_url, "models": [{"id": "qwen"}]},
+        },
+        {"defaultProvider": "primary", "enabledModels": ["primary/*"]},
+    )
+    try:
+        started = time.monotonic()
+        listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+        elapsed = time.monotonic() - started
+    finally:
+        stop()
+        stop_healthy()
+
+    # The resolver timed out, so Pi's full inventory stands; the trickling host is dropped.
+    assert _listed_ids(listing) == ["fallback/qwen"]
+    assert model_catalog._PI_RESOLVER_TIMEOUT_S <= elapsed < budget + 0.4

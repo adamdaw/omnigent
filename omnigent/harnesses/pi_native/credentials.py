@@ -45,7 +45,11 @@ from omnigent.harnesses.pi_native.auth_command import (
     AUTH_DIR_NAME,
     wrap_auth_command,
 )
-from omnigent.harnesses.pi_native.model_scope import ScopableModel, scope_models
+from omnigent.harnesses.pi_native.model_scope import (
+    SCOPE_RESOLVER_TIMEOUT_S,
+    ScopableModel,
+    scope_models,
+)
 from omnigent.inner._proc import kill_tree, spawn_kwargs
 from omnigent.models import model_catalog
 from omnigent.models.databricks_model_discovery import preferred_served_claude_model
@@ -544,17 +548,20 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
     ]
 
 
-def _pi_own_login_scoped_models(root: Path) -> list[ScopableModel]:
+def _pi_own_login_scoped_models(
+    root: Path, *, resolver_timeout_s: float = SCOPE_RESOLVER_TIMEOUT_S
+) -> list[ScopableModel]:
     """Pi's own-login inventory narrowed by ``enabledModels``, in Pi's scope order.
 
     :param root: Pi agent dir whose config to read.
+    :param resolver_timeout_s: Seconds Pi's resolver subprocess may run.
     :returns: The scoped models, or the full inventory when curation is unset,
         unmatched or unavailable (Pi's own fallback).
     """
     entries = _pi_own_login_models(root)
     patterns = _pi_enabled_model_patterns(root)
     if patterns:
-        scoped = scope_models(patterns, entries)
+        scoped = scope_models(patterns, entries, timeout=resolver_timeout_s)
         if scoped:
             entries = scoped
     return entries
@@ -562,6 +569,8 @@ def _pi_own_login_scoped_models(root: Path) -> list[ScopableModel]:
 
 def pi_own_login_routing_models(
     agent_dir: Path | None = None,
+    *,
+    resolver_timeout_s: float = SCOPE_RESOLVER_TIMEOUT_S,
 ) -> tuple[list[ScopableModel], dict[str, str]]:
     """List Pi's own-login models for routing, with each custom provider's endpoint.
 
@@ -571,10 +580,11 @@ def pi_own_login_routing_models(
     by default takes simple work and the others follow as fallbacks.
 
     :param agent_dir: Pi agent dir override (tests); defaults to the host's own.
+    :param resolver_timeout_s: Seconds Pi's ``enabledModels`` resolver may run.
     :returns: The ordered models, and ``models.json`` provider id -> ``baseUrl``.
     """
     root = agent_dir if agent_dir is not None else global_pi_agent_dir()
-    entries = _pi_own_login_scoped_models(root)
+    entries = _pi_own_login_scoped_models(root, resolver_timeout_s=resolver_timeout_s)
     default_provider = _read_json_object(root / "settings.json").get("defaultProvider")
     entries.sort(key=lambda entry: entry.provider != default_provider)
     declared = _read_json_object(root / "models.json").get("providers")
