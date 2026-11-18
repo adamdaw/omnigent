@@ -11,7 +11,6 @@ Databricks credential mint is stubbed with the real
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import time
@@ -3627,6 +3626,7 @@ def test_pi_endpoint_probe_reads_only_the_response_head() -> None:
         pytest.param("http://primary.example.com:abc/v1", id="invalid-url"),
         pytest.param("http://" + "a" * 64 + ".example.com/v1", id="unencodable-host"),
         pytest.param("ftp://primary.example.com/v1", id="unsupported-protocol"),
+        pytest.param("http://[broken/v1", id="unclosed-ipv6-bracket"),
     ],
 )
 def test_pi_subscription_malformed_base_url_drops_only_that_provider(
@@ -3798,13 +3798,11 @@ def test_pi_subscription_concurrent_cold_listings_agree(
     assert 2 <= len(probed) <= 8
 
 
-def _live_probe_threads(base_url: str) -> int:
-    """Count running probe threads for *base_url* (named by its host:port)."""
+def _live_probe_threads() -> int:
+    """Count running Pi endpoint probe threads."""
     import threading
-    from urllib.parse import urlsplit
 
-    name = f"pi-endpoint-probe {urlsplit(base_url).netloc}"
-    return sum(1 for t in threading.enumerate() if t.name == name)
+    return sum(1 for t in threading.enumerate() if t.name == "pi-endpoint-probe")
 
 
 def test_pi_endpoint_probes_stay_bounded_against_trickling_endpoint(
@@ -3838,11 +3836,13 @@ def test_pi_endpoint_probes_stay_bounded_against_trickling_endpoint(
     def _settle() -> tuple[int, int]:
         # The server notices a closed connection only on its next write.
         settled = time.monotonic() + 5
-        while (_live_probe_threads(url) or connections) and time.monotonic() < settled:
+        while (_live_probe_threads() or connections) and time.monotonic() < settled:
             wait([], timeout=0.02)
-        return _live_probe_threads(url), len(connections)
+        return _live_probe_threads(), len(connections)
 
     try:
+        # Probes from earlier tests end by their own deadlines; start from none.
+        assert _settle() == (0, 0)
         for _expiry in range(3):
             now["t"] += model_catalog._PI_ENDPOINT_TTL_S + 1
             with ThreadPoolExecutor(max_workers=4) as pool:
@@ -3851,7 +3851,7 @@ def test_pi_endpoint_probes_stay_bounded_against_trickling_endpoint(
                     for _ in range(4)
                 ]
                 while wait(calls, timeout=0.01).not_done:
-                    peak_threads = max(peak_threads, _live_probe_threads(url))
+                    peak_threads = max(peak_threads, _live_probe_threads())
                     peak_connections = max(peak_connections, len(connections))
             assert all(call.result().models == () for call in calls)
             # Each probe closes its connection at its own deadline: nothing stays open.
@@ -3978,30 +3978,69 @@ def test_pi_catalog_rows_share_one_listing_within_budget(
 def test_pi_connect_spends_one_deadline_across_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every address of a multi-address host shares the probe deadline, not one each."""
     import socket
+    import threading
 
-    # A full listen backlog makes further connects hang, like a blackholed address.
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(0)
-    address = listener.getsockname()
-    fillers = []
-    for _ in range(4):
-        filler = socket.socket()
-        filler.setblocking(False)
-        with contextlib.suppress(BlockingIOError):
-            filler.connect(address)
-        fillers.append(filler)
-    blackholed = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", address)] * 3
-    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: blackholed)
-    budget = 0.6
-    try:
-        started = time.monotonic()
-        up = model_catalog._pi_endpoint_up("http://multi.example.com/v1", started + budget)
-        elapsed = time.monotonic() - started
-    finally:
-        for filler in fillers:
-            filler.close()
-        listener.close()
+    attempts: list[float] = []
+
+    class _Blackholed:
+        """A socket whose connect blocks for its whole timeout, then times out."""
+
+        def __init__(self, *_args: object) -> None:
+            self._timeout = 0.0
+
+        def settimeout(self, timeout: float) -> None:
+            self._timeout = timeout
+
+        def connect(self, _address: object) -> None:
+            attempts.append(self._timeout)
+            threading.Event().wait(self._timeout)
+            raise TimeoutError("stand-in connect timed out")
+
+        def close(self) -> None:
+            pass
+
+    address = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 80))
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [address] * 3)
+    monkeypatch.setattr(socket, "socket", _Blackholed)
+    budget = 0.5
+    started = time.monotonic()
+
+    up = model_catalog._pi_endpoint_up("http://multi.example.com/v1", started + budget)
 
     assert not up
-    assert elapsed < budget + 0.3
+    # Per-address timeouts would grant 3 x budget; a shared deadline grants budget in total.
+    assert attempts and sum(attempts) <= budget
+    assert time.monotonic() - started < budget + 2.0
+
+
+def test_pi_listing_older_build_cannot_replace_newer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Of two overlapping builds, a slower, earlier-started one never overwrites the newer."""
+    import threading
+
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
+    older_entered, release_older = threading.Event(), threading.Event()
+    older = ModelListing(source="cli", verified=False, models=(), note="older")
+    newer = ModelListing(source="cli", verified=False, models=(), note="newer")
+    builds = iter([older, newer])
+
+    def _build() -> ModelListing:
+        listing = next(builds)
+        if listing is older:
+            older_entered.set()
+            release_older.wait(10)
+        return listing
+
+    monkeypatch.setattr(model_catalog, "_build_pi_own_login_listing", _build)
+    first: list[ModelListing | None] = []
+    racer = threading.Thread(target=lambda: first.append(model_catalog._pi_own_login_listing()))
+    racer.start()
+    assert older_entered.wait(10)
+
+    second = model_catalog._pi_own_login_listing()
+    release_older.set()
+    racer.join(10)
+
+    assert (first, second) == ([older], newer)
+    assert model_catalog._pi_own_login_listing() is newer

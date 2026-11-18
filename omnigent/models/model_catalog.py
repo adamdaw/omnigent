@@ -1609,9 +1609,8 @@ def _pi_start_probe(base_url: str, deadline: float) -> _PiProbe:
                 _pi_probes_in_flight.pop(base_url, None)
             probe.done.set()
 
-    # Name by host:port only: a baseUrl's userinfo or query must not reach thread dumps.
-    host_port = urlsplit(base_url).netloc.rpartition("@")[2]
-    threading.Thread(target=_run, name=f"pi-endpoint-probe {host_port}", daemon=True).start()
+    # A fixed name: parsing here could raise, and a baseUrl may carry secrets.
+    threading.Thread(target=_run, name="pi-endpoint-probe", daemon=True).start()
     return probe
 
 
@@ -1643,6 +1642,8 @@ _PI_LISTING_TTL_S = 5.0
 _pi_listing_cache: TTLCache[str, tuple[ModelListing | None]] = TTLCache(
     maxsize=8, ttl=_PI_LISTING_TTL_S
 )
+#: Pi agent dir -> number of the latest listing build started for it.
+_pi_listing_generation: dict[str, int] = {}
 
 
 def _pi_own_login_listing() -> ModelListing | None:
@@ -1656,11 +1657,15 @@ def _pi_own_login_listing() -> ModelListing | None:
     key = str(global_pi_agent_dir())
     with _pi_endpoint_up_lock:
         cached = _pi_listing_cache.get(key)
-    if cached is not None:
-        return cached[0]
+        if cached is not None:
+            return cached[0]
+        generation = _pi_listing_generation.get(key, 0) + 1
+        _pi_listing_generation[key] = generation
     listing = _build_pi_own_login_listing()
     with _pi_endpoint_up_lock:
-        _pi_listing_cache[key] = (listing,)
+        # Only the latest-started build may store, so a slower, older one cannot win.
+        if _pi_listing_generation[key] == generation:
+            _pi_listing_cache[key] = (listing,)
     return listing
 
 
