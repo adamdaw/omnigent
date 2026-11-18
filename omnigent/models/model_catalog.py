@@ -35,8 +35,11 @@ import json
 import logging
 import os
 import re
+import socket
+import ssl
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 from urllib.parse import urlsplit
@@ -181,6 +184,9 @@ _DEVIN_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 
 # SDK harnesses whose CLI-login launch shares a native model-probe catalog.
 _SDK_PROBE_CLI: dict[str, str] = {"claude-sdk": "claude", "claude_sdk": "claude", "codex": "codex"}
+
+# Native harnesses whose subscription launch runs the same CLI login the probe ran.
+_NATIVE_PROBE_CLI: dict[str, str] = {"claude-native": "claude", "codex-native": "codex"}
 
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
@@ -399,6 +405,9 @@ def clear_model_catalog_cache() -> None:
     """
     with _listing_cache_lock:
         _listing_cache.clear()
+    with _pi_endpoint_up_lock:
+        _pi_endpoint_up_cache.clear()
+        _pi_listing_cache.clear()
 
 
 def model_family_token(model_id: str) -> str:
@@ -1454,9 +1463,15 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
     source of truth, so a path that cannot probe reports nothing rather
     than a plausible-but-stale list.
 
+    Pi is the exception: its own config declares its models before launch.
+
     :param provider: A ``kind="subscription"`` provider descriptor.
-    :returns: A ``source="static"`` listing with no models.
+    :returns: A ``source="static"`` listing with no models, or Pi's own listing.
     """
+    if provider.cli == "pi":
+        pi_listing = _pi_own_login_listing()
+        if pi_listing is not None:
+            return pi_listing
     return ModelListing(
         source="static",
         verified=False,
@@ -1465,6 +1480,228 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
             f"the {provider.cli or 'unknown'} CLI login exposes no model-listing "
             "API before launch; the live listing comes from probing the harness"
         ),
+    )
+
+
+#: How long a Pi provider endpoint's reachability is reused; short so a recovered host returns.
+_PI_ENDPOINT_TTL_S = 30.0
+#: Whole Pi catalog generation (resolver + probes), under the server's 5 s catalog limit.
+_PI_LISTING_BUDGET_S = 4.0
+#: Pi's ``enabledModels`` resolver subprocess, the first step of that budget.
+_PI_RESOLVER_TIMEOUT_S = 2.0
+#: One probe round, all providers together; also each probe's own lifetime.
+_PI_PROBE_DEADLINE_S = 1.5
+#: Read at most this much of a response looking for its status line.
+_PI_PROBE_HEAD_LIMIT = 1024
+_pi_endpoint_up_cache: TTLCache[str, bool] = TTLCache(maxsize=64, ttl=_PI_ENDPOINT_TTL_S)
+_pi_endpoint_up_lock = threading.Lock()
+
+
+@dataclass
+class _PiProbe:
+    """One in-flight endpoint probe that later callers wait on instead of re-probing."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    up: bool = False
+
+
+#: base URL -> its running probe; at most one probe per URL exists at a time.
+_pi_probes_in_flight: dict[str, _PiProbe] = {}
+
+
+def _pi_time_left(deadline: float) -> float:
+    """Seconds until *deadline*, raising :class:`TimeoutError` once it has passed."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("Pi endpoint probe deadline passed")
+    return left
+
+
+def _pi_connect(host: str, port: int, deadline: float) -> socket.socket:
+    """Connect to the first of *host*'s addresses that accepts before *deadline*.
+
+    Unlike :func:`socket.create_connection`, whose timeout applies per address,
+    every attempt gets only the time left, so a multi-address host cannot
+    overrun the deadline.
+
+    :raises OSError: When no address accepted in time (``TimeoutError`` once spent).
+    """
+    error: OSError = ConnectionError(f"no address accepted for {host}")
+    for family, kind, proto, _name, address in socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM
+    ):
+        conn = socket.socket(family, kind, proto)
+        try:
+            conn.settimeout(_pi_time_left(deadline))
+            conn.connect(address)
+        except OSError as exc:
+            conn.close()
+            error = exc
+            if time.monotonic() >= deadline:
+                break
+            continue
+        return conn
+    raise error
+
+
+def _pi_endpoint_up(base_url: str, deadline: float | None = None) -> bool:
+    """Report whether an HTTP(S) endpoint answers ``GET {base_url}/models`` by *deadline*.
+
+    Any status line counts (the rest is never read): the server is up even when
+    it rejects the request. Every blocking step gets only the time left, so a
+    server trickling bytes cannot hold the probe past *deadline*; only name
+    resolution is bounded by the OS resolver instead. Malformed or non-HTTP URLs
+    count as down.
+
+    :param base_url: The provider's ``baseUrl``, e.g. ``"http://host:8080/v1"``.
+    :param deadline: Absolute :func:`time.monotonic` cut-off; defaults to
+        :data:`_PI_PROBE_DEADLINE_S` from now.
+    :returns: ``True`` when a status line arrived in time.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + _PI_PROBE_DEADLINE_S
+    try:
+        target = urlsplit(f"{base_url.rstrip('/')}/models")
+        if target.scheme not in ("http", "https") or not target.hostname:
+            return False
+        port = target.port or (443 if target.scheme == "https" else 80)
+        request = (
+            f"GET {target.path} HTTP/1.1\r\nHost: {target.netloc.rpartition('@')[2]}\r\n"
+            "Accept: application/json\r\nConnection: close\r\n\r\n"
+        ).encode()
+        with _pi_connect(target.hostname, port, deadline) as raw:
+            raw.settimeout(_pi_time_left(deadline))
+            with (
+                ssl.create_default_context().wrap_socket(raw, server_hostname=target.hostname)
+                if target.scheme == "https"
+                else raw
+            ) as conn:
+                conn.settimeout(_pi_time_left(deadline))
+                conn.sendall(request)
+                head = b""
+                while b"\n" not in head and len(head) < _PI_PROBE_HEAD_LIMIT:
+                    conn.settimeout(_pi_time_left(deadline))
+                    chunk = conn.recv(_PI_PROBE_HEAD_LIMIT)
+                    if not chunk:
+                        break
+                    head += chunk
+    except (OSError, ValueError):
+        return False
+    return head.startswith(b"HTTP/") and b"\n" in head
+
+
+def _pi_start_probe(base_url: str, deadline: float) -> _PiProbe:
+    """Start probing *base_url* on a daemon thread; call with the lock held.
+
+    The probe records its answer in the cache and leaves the in-flight table
+    when it finishes, which :func:`_pi_endpoint_up` guarantees by *deadline*.
+    """
+    probe = _PiProbe()
+
+    def _run() -> None:
+        up = False
+        try:
+            up = _pi_endpoint_up(base_url, deadline)
+        finally:
+            with _pi_endpoint_up_lock:
+                probe.up = up
+                _pi_endpoint_up_cache[base_url] = up
+                _pi_probes_in_flight.pop(base_url, None)
+            probe.done.set()
+
+    # A fixed name: parsing here could raise, and a baseUrl may carry secrets.
+    threading.Thread(target=_run, name="pi-endpoint-probe", daemon=True).start()
+    return probe
+
+
+def _pi_live_endpoints(base_urls: set[str], deadline: float) -> set[str]:
+    """Return the reachable subset of *base_urls*, answering by *deadline*.
+
+    Uncached URLs are probed concurrently, one probe per URL at a time: a caller
+    arriving while a URL's probe runs waits on that probe rather than starting
+    another. A probe not finished by *deadline* counts as down for this caller.
+    Answers are cached for :data:`_PI_ENDPOINT_TTL_S`.
+    """
+    waiting: dict[str, _PiProbe] = {}
+    with _pi_endpoint_up_lock:
+        known = {url: _pi_endpoint_up_cache.get(url) for url in base_urls}
+        for url, up in known.items():
+            if up is None:
+                probe = _pi_probes_in_flight.get(url)
+                if probe is None:
+                    probe = _pi_probes_in_flight[url] = _pi_start_probe(url, deadline)
+                waiting[url] = probe
+    for url, probe in waiting.items():
+        finished = probe.done.wait(max(0.0, deadline - time.monotonic()))
+        known[url] = finished and probe.up
+    return {url for url, up in known.items() if up}
+
+
+#: Reuse one Pi listing (resolver outcome included) across a catalog call's Pi rows.
+_PI_LISTING_TTL_S = 5.0
+_pi_listing_cache: TTLCache[str, tuple[ModelListing | None]] = TTLCache(
+    maxsize=8, ttl=_PI_LISTING_TTL_S
+)
+#: Pi agent dir -> number of the latest listing build started for it.
+_pi_listing_generation: dict[str, int] = {}
+
+
+def _pi_own_login_listing() -> ModelListing | None:
+    """Pi's own-login listing, reused for :data:`_PI_LISTING_TTL_S` per Pi agent dir.
+
+    A catalog builds worker rows one after another, so without reuse every Pi
+    row would spend its own :data:`_PI_LISTING_BUDGET_S`.
+    """
+    from omnigent.harnesses.pi_native.credentials import global_pi_agent_dir
+
+    key = str(global_pi_agent_dir())
+    with _pi_endpoint_up_lock:
+        cached = _pi_listing_cache.get(key)
+        if cached is not None:
+            return cached[0]
+        generation = _pi_listing_generation.get(key, 0) + 1
+        _pi_listing_generation[key] = generation
+    listing = _build_pi_own_login_listing()
+    with _pi_endpoint_up_lock:
+        # Only the latest-started build may store, so a slower, older one cannot win.
+        if _pi_listing_generation[key] == generation:
+            _pi_listing_cache[key] = (listing,)
+    return listing
+
+
+def _build_pi_own_login_listing() -> ModelListing | None:
+    """List the models a Pi on its own login can address, from Pi's own config.
+
+    Providers whose ``baseUrl`` does not answer are dropped, so routing falls
+    through to the next provider (``pollux/*`` down -> ``llamaswap/*`` first).
+    The whole call (Pi's resolver, then the probes) stays within
+    :data:`_PI_LISTING_BUDGET_S`.
+
+    :returns: A ``source="cli"`` listing, or ``None`` when Pi declares no
+        reachable models (the caller keeps the empty pre-launch listing).
+    """
+    from omnigent.harnesses.pi_native.credentials import pi_own_login_routing_models
+
+    deadline = time.monotonic() + _PI_LISTING_BUDGET_S
+    entries, base_urls = pi_own_login_routing_models(resolver_timeout_s=_PI_RESOLVER_TIMEOUT_S)
+    live = _pi_live_endpoints(
+        {base_urls[e.provider] for e in entries if e.provider in base_urls},
+        min(deadline, time.monotonic() + _PI_PROBE_DEADLINE_S),
+    )
+    ids = [
+        entry.reference
+        for entry in entries
+        if entry.provider not in base_urls or base_urls[entry.provider] in live
+    ]
+    if not ids:
+        return None
+    return ModelListing(
+        source="cli",
+        verified=False,
+        models=tuple(
+            ModelEntry(id=model_id, family=model_family_token(model_id)) for model_id in ids
+        ),
+        note="models declared in Pi's own config (models.json, logins, settings.json)",
     )
 
 
@@ -1513,11 +1750,12 @@ def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
 def _cli_login_probe_listing(
     spec: object, harness: str, provider: ResolvedModelProvider
 ) -> ModelListing | None:
-    """Replay the native probe catalog for a CLI-login Claude or Codex SDK worker.
+    """Replay the native probe catalog for a CLI-login Claude or Codex worker.
 
     Subscription and unconfigured SDK workers launch the CLI on its own login,
     which exposes no listing API; the host caches its native probe of that launch.
-    Native workers are skipped: their launches add routes this readout cannot see.
+    Native workers count only on a subscription: other native launches add
+    routes (brokers, adopted config providers) this readout cannot see.
 
     :param spec: The worker's (sub-)agent spec.
     :param harness: The worker's harness id, e.g. ``"claude-sdk"``.
@@ -1525,7 +1763,10 @@ def _cli_login_probe_listing(
     :returns: A probe-backed listing, or ``None`` when the worker does not
         launch on a usable CLI login or its catalog is not cached.
     """
-    cli = _SDK_PROBE_CLI.get(canonicalize_harness(harness) or harness)
+    canonical = canonicalize_harness(harness) or harness
+    cli = _SDK_PROBE_CLI.get(canonical)
+    if cli is None and provider.kind == SUBSCRIPTION_KIND:
+        cli = _NATIVE_PROBE_CLI.get(canonical)
     if cli is None:
         return None
     if provider.kind == SUBSCRIPTION_KIND:

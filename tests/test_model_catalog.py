@@ -1619,16 +1619,20 @@ def test_cli_login_rows_replay_native_probe_catalogs(
     catalog = catalog_for_spec(_cli_login_parent())
 
     expected = {"self": _CLI_LOGIN_CLAUDE_IDS, "codex": _CLI_LOGIN_CODEX_IDS}
+    if subscribed:
+        # A subscription native launch runs the same CLI login the probe ran.
+        expected |= {"claude_code": _CLI_LOGIN_CLAUDE_IDS, "codex_native": _CLI_LOGIN_CODEX_IDS}
     for name, model_ids in expected.items():
         row = catalog[name]
         assert row["source"] == "cli"
         assert row["verified"] is True
         assert [model["id"] for model in row["models"]] == model_ids
         assert "cannot run here" not in str(row["note"])
-    # Native launches add routes (brokers, adopted config providers) this readout cannot see.
-    for name in ("claude_code", "codex_native"):
-        assert catalog[name]["source"] == ("static" if subscribed else "none")
-        assert catalog[name]["models"] == []
+    # Other native launches add routes (brokers, adopted config providers) this readout cannot see.
+    if not subscribed:
+        for name in ("claude_code", "codex_native"):
+            assert catalog[name]["source"] == "none"
+            assert catalog[name]["models"] == []
     # The listing reads the catalog; provider resolution (and dispatch) is unchanged.
     for harness in ("claude-sdk", "codex"):
         assert resolve_model_provider(_worker_spec(harness), harness).kind == provider_kind
@@ -3268,3 +3272,775 @@ def test_acp_provider_resolution_failure_does_not_become_empty_catalog(
     unbound = _worker_spec("acp:custom")
     assert model_catalog.acp_curated_models(unbound) == ()
     model_catalog.validate_acp_model(unbound, "another-model")
+
+
+# ── Pi's own-login catalog (subscription ``pi``) ─────────────────────
+
+_PI_SUBSCRIPTION = ResolvedModelProvider(kind="subscription", cli="pi")
+_PI_PRIMARY_URL = "http://primary.example.com:8080/v1"
+_PI_FALLBACK_URL = "http://fallback.example.com:8080/v1"
+
+
+def _write_pi_agent_dir(
+    monkeypatch: pytest.MonkeyPatch, root: Path, settings: dict[str, object] | None
+) -> None:
+    """Declare two keyed custom Pi providers, ``fallback`` first, under *root*.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param root: Directory to use as Pi's agent dir.
+    :param settings: ``settings.json`` contents, or ``None`` to omit the file.
+    """
+    root.mkdir(exist_ok=True)
+    providers = {
+        name: {
+            "baseUrl": url,
+            "api": "openai-completions",
+            "apiKey": "unused",
+            "models": [{"id": "small"}, {"id": "large"}],
+        }
+        for name, url in (("fallback", _PI_FALLBACK_URL), ("primary", _PI_PRIMARY_URL))
+    }
+    (root / "models.json").write_text(json.dumps({"providers": providers}))
+    if settings is not None:
+        (root / "settings.json").write_text(json.dumps(settings))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(root))
+
+
+def _pi_endpoints(monkeypatch: pytest.MonkeyPatch, down: set[str]) -> list[str]:
+    """Stub Pi endpoint probes, reporting *down* unreachable.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param down: Base URLs that do not answer.
+    :returns: The list each probe appends its base URL to.
+    """
+    probed: list[str] = []
+
+    def _probe(base_url: str, _deadline: float | None = None) -> bool:
+        probed.append(base_url)
+        return base_url not in down
+
+    monkeypatch.setattr(model_catalog, "_pi_endpoint_up", _probe)
+    return probed
+
+
+def _listed_ids(listing: ModelListing) -> list[str]:
+    return [model.id for model in listing.models]
+
+
+def test_pi_subscription_lists_own_models_default_provider_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pi's default provider leads, so routing's cheapest-first slot is the host Pi opens."""
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"defaultProvider": "primary"})
+    _pi_endpoints(monkeypatch, down=set())
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert listing.source == "cli"
+    assert _listed_ids(listing) == [
+        "primary/small",
+        "primary/large",
+        "fallback/small",
+        "fallback/large",
+    ]
+
+
+def test_pi_subscription_respects_enabled_models_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``enabledModels`` narrows the list and its order stands within each provider."""
+    from omnigent.harnesses.pi_native import credentials
+
+    patterns = ["primary/large", "fallback/small", "primary/small"]
+    _write_pi_agent_dir(
+        monkeypatch,
+        tmp_path / "pi",
+        {"defaultProvider": "primary", "enabledModels": patterns},
+    )
+    _pi_endpoints(monkeypatch, down=set())
+    # Pi's resolver returns matches in pattern order; avoid needing Node here.
+    monkeypatch.setattr(
+        credentials,
+        "scope_models",
+        lambda pats, models, **_options: [m for p in pats for m in models if m.reference == p],
+    )
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(listing) == ["primary/large", "primary/small", "fallback/small"]
+
+
+def test_pi_subscription_drops_unreachable_provider_and_caches_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A down default provider drops out, so the fallback leads; probes are reused."""
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"defaultProvider": "primary"})
+    probed = _pi_endpoints(monkeypatch, down={_PI_PRIMARY_URL})
+
+    first = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+    second = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(first) == ["fallback/small", "fallback/large"]
+    assert _listed_ids(second) == _listed_ids(first)
+    assert sorted(probed) == sorted([_PI_PRIMARY_URL, _PI_FALLBACK_URL])
+
+
+def test_pi_subscription_probes_endpoints_concurrently(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each probe waits for the other: serial probing would break the barrier."""
+    import threading
+
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", None)
+    barrier = threading.Barrier(2, timeout=5)
+
+    def _probe(_base_url: str, _deadline: float | None = None) -> bool:
+        barrier.wait()
+        return True
+
+    monkeypatch.setattr(model_catalog, "_pi_endpoint_up", _probe)
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert len(listing.models) == 4
+
+
+@pytest.mark.parametrize(
+    "models_json",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("{not json", id="invalid"),
+        pytest.param('{"providers": []}', id="wrong-shape"),
+    ],
+)
+def test_pi_subscription_without_usable_config_keeps_empty_listing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, models_json: str | None
+) -> None:
+    """Missing or malformed Pi config keeps the empty pre-launch listing."""
+    root = tmp_path / "pi"
+    root.mkdir()
+    if models_json is not None:
+        (root / "models.json").write_text(models_json)
+    (root / "settings.json").write_text("[1, 2]")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(root))
+    probed = _pi_endpoints(monkeypatch, down=set())
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert listing.source == "static"
+    assert listing.models == ()
+    assert probed == []
+
+
+def test_pi_subscription_all_endpoints_down_keeps_empty_listing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With every declared host down there is nothing to route to."""
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"defaultProvider": "primary"})
+    _pi_endpoints(monkeypatch, down={_PI_PRIMARY_URL, _PI_FALLBACK_URL})
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert listing.source == "static"
+    assert listing.models == ()
+
+
+def test_pi_subscription_worker_row_lists_own_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``pi: {kind: subscription, cli: pi}`` host config reaches Pi's own listing."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  pi:\n    kind: subscription\n    cli: pi\n    default: pi\n",
+    )
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"defaultProvider": "primary"})
+    _pi_endpoints(monkeypatch, down=set())
+
+    listing = list_models_for_worker(_worker_spec("pi"), "pi")
+
+    assert _listed_ids(listing)[:2] == ["primary/small", "primary/large"]
+
+
+def test_pi_endpoint_probe_counts_any_http_response_as_up() -> None:
+    """A 404 still means the host answers; a refused connection means it is down."""
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _NotFound(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), _NotFound)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    with socket.socket() as closed:
+        closed.bind(("127.0.0.1", 0))
+        closed_port = closed.getsockname()[1]
+    try:
+        assert model_catalog._pi_endpoint_up(f"http://127.0.0.1:{server.server_port}/v1/")
+        assert not model_catalog._pi_endpoint_up(f"http://127.0.0.1:{closed_port}/v1")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _serve_raw(
+    chunks: list[bytes], interval: float, live: set[object] | None = None
+) -> tuple[str, object]:
+    """Serve every connection *chunks*, one per *interval*, then the last chunk forever.
+
+    :param chunks: Byte chunks to write in order; the last repeats until closed.
+    :param interval: Seconds between writes.
+    :param live: Optional set holding each connection while the client keeps it open.
+    :returns: The ``http://127.0.0.1:<port>/v1`` base URL and a ``stop`` callable.
+    """
+    import socket
+    import threading
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    stopped = threading.Event()
+
+    def _trickle(conn: socket.socket) -> None:
+        if live is not None:
+            live.add(conn)
+        with conn:
+            index = 0
+            while not stopped.is_set():
+                try:
+                    conn.sendall(chunks[min(index, len(chunks) - 1)])
+                except OSError:
+                    break
+                index += 1
+                stopped.wait(interval)
+        if live is not None:
+            live.discard(conn)
+
+    def _accept() -> None:
+        while not stopped.is_set():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=_trickle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=_accept, daemon=True).start()
+
+    def _stop() -> None:
+        stopped.set()
+        listener.close()
+
+    return f"http://127.0.0.1:{listener.getsockname()[1]}/v1", _stop
+
+
+def _write_pi_providers(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    providers: dict[str, dict[str, object]],
+    settings: dict[str, object] | None = None,
+) -> None:
+    """Write a Pi agent dir declaring exactly *providers* (keyed, so all are usable).
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param root: Directory to use as Pi's agent dir.
+    :param providers: ``models.json`` providers; ``apiKey`` is added to each.
+    :param settings: ``settings.json`` contents, or ``None`` to omit the file.
+    """
+    root.mkdir(exist_ok=True)
+    declared = {name: {"apiKey": "unused", **payload} for name, payload in providers.items()}
+    (root / "models.json").write_text(json.dumps({"providers": declared}))
+    if settings is not None:
+        (root / "settings.json").write_text(json.dumps(settings))
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(root))
+
+
+def test_pi_endpoint_round_drops_trickling_endpoint_within_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A server trickling its response head defeats per-read timeouts, not the round deadline."""
+    trickle_url, stop = _serve_raw([b"H", b"T", b"T", b"P"], interval=0.2)
+    healthy_url, stop_healthy = _serve_raw([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"], 5)
+    _write_pi_providers(
+        monkeypatch,
+        tmp_path / "pi",
+        {
+            "primary": {"baseUrl": trickle_url, "models": [{"id": "qwen"}]},
+            "fallback": {"baseUrl": healthy_url, "models": [{"id": "qwen"}]},
+        },
+        {"defaultProvider": "primary"},
+    )
+    try:
+        started = time.monotonic()
+        listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+        elapsed = time.monotonic() - started
+    finally:
+        stop()
+        stop_healthy()
+
+    assert _listed_ids(listing) == ["fallback/qwen"]
+    assert elapsed < model_catalog._PI_PROBE_DEADLINE_S + 1.0
+
+
+def test_pi_endpoint_probe_reads_only_the_response_head() -> None:
+    """An endpoint that answers then withholds its body is up before the body is released."""
+    import socket
+    import threading
+
+    release = threading.Event()
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+
+    def _serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
+            release.wait(10)
+
+    threading.Thread(target=_serve, daemon=True).start()
+    answered: list[bool] = []
+    url = f"http://127.0.0.1:{listener.getsockname()[1]}/v1"
+    probe = threading.Thread(
+        target=lambda: answered.append(model_catalog._pi_endpoint_up(url, time.monotonic() + 10))
+    )
+    try:
+        probe.start()
+        probe.join(10)
+        assert answered == [True]
+        assert not release.is_set()
+    finally:
+        release.set()
+        listener.close()
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        pytest.param("http://primary.example.com:abc/v1", id="invalid-url"),
+        pytest.param("http://" + "a" * 64 + ".example.com/v1", id="unencodable-host"),
+        pytest.param("ftp://primary.example.com/v1", id="unsupported-protocol"),
+        pytest.param("http://[broken/v1", id="unclosed-ipv6-bracket"),
+    ],
+)
+def test_pi_subscription_malformed_base_url_drops_only_that_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_url: str
+) -> None:
+    """A malformed default-provider URL drops that provider; the healthy fallback stays."""
+    healthy_url, stop = _serve_raw([b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"], 5)
+    _write_pi_providers(
+        monkeypatch,
+        tmp_path / "pi",
+        {
+            "primary": {"baseUrl": bad_url, "models": [{"id": "qwen"}]},
+            "fallback": {"baseUrl": healthy_url, "models": [{"id": "qwen"}]},
+        },
+        {"defaultProvider": "primary"},
+    )
+    try:
+        listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+    finally:
+        stop()
+
+    assert listing.source == "cli"
+    assert _listed_ids(listing) == ["fallback/qwen"]
+
+
+def test_pi_subscription_enabled_models_globs_with_pis_resolver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pi's own resolver expands globs in catalog order and skips unmatched patterns."""
+    import shutil
+
+    if shutil.which("pi") is None or shutil.which("node") is None:
+        pytest.skip("needs the installed Pi CLI and Node for Pi's model resolver")
+    _isolate_config(monkeypatch, tmp_path, "")
+    _write_pi_agent_dir(
+        monkeypatch,
+        tmp_path / "pi",
+        {
+            "defaultProvider": "primary",
+            "enabledModels": ["fallback/sm*", "nomatch/*", "primary/*"],
+        },
+    )
+    _pi_endpoints(monkeypatch, down=set())
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(listing) == ["primary/small", "primary/large", "fallback/small"]
+
+
+def test_pi_subscription_unmatched_enabled_models_lists_full_inventory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Curation that matches nothing falls back to every model, as Pi itself does."""
+    from omnigent.harnesses.pi_native import credentials
+
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"enabledModels": ["nomatch/*"]})
+    _pi_endpoints(monkeypatch, down=set())
+    monkeypatch.setattr(credentials, "scope_models", lambda _patterns, _models, **_options: [])
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(listing) == [
+        "fallback/small",
+        "fallback/large",
+        "primary/small",
+        "primary/large",
+    ]
+
+
+def test_pi_subscription_dedupes_models_and_skips_empty_providers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A repeated model id lists once; a provider with no models is neither listed nor probed."""
+    _write_pi_providers(
+        monkeypatch,
+        tmp_path / "pi",
+        {
+            "primary": {"baseUrl": _PI_PRIMARY_URL, "models": [{"id": "qwen"}, {"id": "qwen"}]},
+            "empty": {"baseUrl": "http://empty.example.com/v1", "models": []},
+        },
+    )
+    probed = _pi_endpoints(monkeypatch, down=set())
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(listing) == ["primary/qwen"]
+    assert probed == [_PI_PRIMARY_URL]
+
+
+def test_pi_subscription_lists_login_providers_unprobed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A provider with no ``baseUrl`` (a Pi login) has nothing to probe and stays listed."""
+    root = tmp_path / "pi"
+    _write_pi_providers(
+        monkeypatch,
+        root,
+        {"primary": {"baseUrl": _PI_PRIMARY_URL, "models": [{"id": "qwen"}]}},
+        {"defaultProvider": "primary"},
+    )
+    (root / "auth.json").write_text(json.dumps({"cloud": {"type": "oauth"}}))
+    (root / "models-store.json").write_text(json.dumps({"cloud": {"models": [{"id": "big"}]}}))
+    probed = _pi_endpoints(monkeypatch, down={_PI_PRIMARY_URL})
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(listing) == ["cloud/big"]
+    assert probed == [_PI_PRIMARY_URL]
+
+
+def test_pi_endpoint_probe_cache_expires_after_ttl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A down host is re-probed once the cache entry expires, and returns when it recovers."""
+    now = {"t": 1000.0}
+    monkeypatch.setattr(
+        model_catalog,
+        "_pi_endpoint_up_cache",
+        TTLCache(maxsize=64, ttl=model_catalog._PI_ENDPOINT_TTL_S, timer=lambda: now["t"]),
+    )
+    monkeypatch.setattr(
+        model_catalog,
+        "_pi_listing_cache",
+        TTLCache(maxsize=8, ttl=model_catalog._PI_LISTING_TTL_S, timer=lambda: now["t"]),
+    )
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"defaultProvider": "primary"})
+    down = {_PI_PRIMARY_URL}
+    probed: list[str] = []
+
+    def _probe(base_url: str, _deadline: float | None = None) -> bool:
+        probed.append(base_url)
+        return base_url not in down
+
+    monkeypatch.setattr(model_catalog, "_pi_endpoint_up", _probe)
+
+    first = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+    down.clear()
+    now["t"] += model_catalog._PI_ENDPOINT_TTL_S - 1
+    cached = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+    # Past both the probe's TTL and the listing reuse window started at the last call.
+    now["t"] += model_catalog._PI_LISTING_TTL_S + 1
+    expired = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(first)[0] == "fallback/small"
+    assert _listed_ids(cached) == _listed_ids(first)
+    assert _listed_ids(expired)[0] == "primary/small"
+    assert len(probed) == 4
+
+
+def test_pi_subscription_concurrent_cold_listings_agree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Concurrent cold catalog calls may probe twice but return the same correct listing."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"defaultProvider": "primary"})
+    probed = _pi_endpoints(monkeypatch, down={_PI_PRIMARY_URL})
+    start = threading.Barrier(4, timeout=5)
+
+    def _list(_index: int) -> list[str]:
+        start.wait()
+        return _listed_ids(model_catalog.listing_for_provider(_PI_SUBSCRIPTION))
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(_list, range(4)))
+
+    assert results == [["fallback/small", "fallback/large"]] * 4
+    assert 2 <= len(probed) <= 8
+
+
+def _live_probe_threads() -> int:
+    """Count running Pi endpoint probe threads."""
+    import threading
+
+    return sum(1 for t in threading.enumerate() if t.name == "pi-endpoint-probe")
+
+
+def test_pi_endpoint_probes_stay_bounded_against_trickling_endpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cache expiries and concurrent cold calls keep at most one probe and one connection per URL.
+
+    Each probe also closes its connection at its own deadline, so both drop to zero.
+    """
+    from concurrent.futures import ThreadPoolExecutor, wait
+
+    monkeypatch.setattr(model_catalog, "_PI_PROBE_DEADLINE_S", 0.3)
+    now = {"t": 1000.0}
+    monkeypatch.setattr(
+        model_catalog,
+        "_pi_endpoint_up_cache",
+        TTLCache(maxsize=64, ttl=model_catalog._PI_ENDPOINT_TTL_S, timer=lambda: now["t"]),
+    )
+    monkeypatch.setattr(
+        model_catalog,
+        "_pi_listing_cache",
+        TTLCache(maxsize=8, ttl=model_catalog._PI_LISTING_TTL_S, timer=lambda: now["t"]),
+    )
+    connections: set[object] = set()
+    url, stop = _serve_raw([b"H"], interval=0.02, live=connections)
+    _write_pi_providers(
+        monkeypatch, tmp_path / "pi", {"primary": {"baseUrl": url, "models": [{"id": "qwen"}]}}
+    )
+    peak_threads = peak_connections = 0
+
+    def _settle() -> tuple[int, int]:
+        # The server notices a closed connection only on its next write.
+        settled = time.monotonic() + 5
+        while (_live_probe_threads() or connections) and time.monotonic() < settled:
+            wait([], timeout=0.02)
+        return _live_probe_threads(), len(connections)
+
+    try:
+        # Probes from earlier tests end by their own deadlines; start from none.
+        assert _settle() == (0, 0)
+        for _expiry in range(3):
+            now["t"] += model_catalog._PI_ENDPOINT_TTL_S + 1
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                calls = [
+                    pool.submit(model_catalog.listing_for_provider, _PI_SUBSCRIPTION)
+                    for _ in range(4)
+                ]
+                while wait(calls, timeout=0.01).not_done:
+                    peak_threads = max(peak_threads, _live_probe_threads())
+                    peak_connections = max(peak_connections, len(connections))
+            assert all(call.result().models == () for call in calls)
+            # Each probe closes its connection at its own deadline: nothing stays open.
+            assert _settle() == (0, 0)
+    finally:
+        stop()
+
+    assert peak_threads == 1
+    assert peak_connections <= 1
+
+
+def _install_blocking_pi_resolver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[int]:
+    """Put a stand-in Pi CLI on ``PATH`` whose resolver blocks past any subprocess timeout.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    :returns: A list that gains one entry per resolver subprocess run.
+    """
+    import shutil
+
+    from omnigent.harnesses.pi_native import model_scope
+
+    if shutil.which("node") is None:
+        pytest.skip("needs Node to run the stand-in Pi resolver")
+    dist = tmp_path / "pi-cli" / "dist"
+    (dist / "core").mkdir(parents=True)
+    (dist / "cli.js").write_text("")
+    (dist / "cli.js").chmod(0o755)
+    (dist / "core" / "model-resolver.js").write_text(
+        "export function resolveModelScopeFromModels() {\n"
+        "  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000);\n"
+        "}\n"
+    )
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "pi").symlink_to(dist / "cli.js")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+    model_scope._scoped_indices.cache_clear()
+    runs: list[int] = []
+    resolve = model_scope._scoped_indices
+
+    def _counted(*args: object) -> tuple[int, ...]:
+        runs.append(1)
+        return resolve(*args)
+
+    monkeypatch.setattr(model_scope, "_scoped_indices", _counted)
+    return runs
+
+
+def test_pi_listing_shares_one_deadline_across_resolver_and_probes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A slow ``enabledModels`` resolver eats into the probes' time, not the listing budget."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    _install_blocking_pi_resolver(monkeypatch, tmp_path)
+    budget = model_catalog._PI_RESOLVER_TIMEOUT_S + 0.5
+    monkeypatch.setattr(model_catalog, "_PI_LISTING_BUDGET_S", budget)
+    trickle_url, stop = _serve_raw([b"H"], interval=0.02)
+    healthy_url, stop_healthy = _serve_raw([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"], 5)
+    _write_pi_providers(
+        monkeypatch,
+        tmp_path / "pi",
+        {
+            "primary": {"baseUrl": trickle_url, "models": [{"id": "qwen"}]},
+            "fallback": {"baseUrl": healthy_url, "models": [{"id": "qwen"}]},
+        },
+        {"defaultProvider": "primary", "enabledModels": ["primary/*"]},
+    )
+    try:
+        started = time.monotonic()
+        listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+        elapsed = time.monotonic() - started
+    finally:
+        stop()
+        stop_healthy()
+
+    # The resolver timed out, so Pi's full inventory stands; the trickling host is dropped.
+    assert _listed_ids(listing) == ["fallback/qwen"]
+    assert model_catalog._PI_RESOLVER_TIMEOUT_S <= elapsed < budget + 0.4
+
+
+def test_pi_catalog_rows_share_one_listing_within_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Several Pi rows in one catalog reuse one bounded listing; the slow resolver runs once."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  pi:\n    kind: subscription\n    cli: pi\n    default: pi\n",
+    )
+    runs = _install_blocking_pi_resolver(monkeypatch, tmp_path)
+    healthy_url, stop = _serve_raw([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"], 5)
+    _write_pi_providers(
+        monkeypatch,
+        tmp_path / "pi",
+        {"primary": {"baseUrl": healthy_url, "models": [{"id": "qwen"}]}},
+        {"enabledModels": ["primary/*"]},
+    )
+    parent = AgentSpec(
+        spec_version=1,
+        name="orchestrator",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi"}),
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                name=f"pi_{index}",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "pi"}),
+            )
+            for index in range(3)
+        ],
+    )
+    try:
+        started = time.monotonic()
+        catalog = catalog_for_spec(parent)
+        elapsed = time.monotonic() - started
+    finally:
+        stop()
+
+    assert runs == [1]
+    assert elapsed < model_catalog._PI_LISTING_BUDGET_S
+    for name in ("self", "pi_0", "pi_1", "pi_2"):
+        assert [model["id"] for model in catalog[name]["models"]] == ["primary/qwen"]
+
+
+def test_pi_connect_spends_one_deadline_across_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every address of a multi-address host shares the probe deadline, not one each."""
+    import socket
+    import threading
+
+    attempts: list[float] = []
+
+    class _Blackholed:
+        """A socket whose connect blocks for its whole timeout, then times out."""
+
+        def __init__(self, *_args: object) -> None:
+            self._timeout = 0.0
+
+        def settimeout(self, timeout: float) -> None:
+            self._timeout = timeout
+
+        def connect(self, _address: object) -> None:
+            attempts.append(self._timeout)
+            threading.Event().wait(self._timeout)
+            raise TimeoutError("stand-in connect timed out")
+
+        def close(self) -> None:
+            pass
+
+    address = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 80))
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [address] * 3)
+    monkeypatch.setattr(socket, "socket", _Blackholed)
+    budget = 0.5
+    started = time.monotonic()
+
+    up = model_catalog._pi_endpoint_up("http://multi.example.com/v1", started + budget)
+
+    assert not up
+    # Per-address timeouts would grant 3 x budget; a shared deadline grants budget in total.
+    assert attempts and sum(attempts) <= budget
+    assert time.monotonic() - started < budget + 2.0
+
+
+def test_pi_listing_older_build_cannot_replace_newer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Of two overlapping builds, a slower, earlier-started one never overwrites the newer."""
+    import threading
+
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi"))
+    older_entered, release_older = threading.Event(), threading.Event()
+    older = ModelListing(source="cli", verified=False, models=(), note="older")
+    newer = ModelListing(source="cli", verified=False, models=(), note="newer")
+    builds = iter([older, newer])
+
+    def _build() -> ModelListing:
+        listing = next(builds)
+        if listing is older:
+            older_entered.set()
+            release_older.wait(10)
+        return listing
+
+    monkeypatch.setattr(model_catalog, "_build_pi_own_login_listing", _build)
+    first: list[ModelListing | None] = []
+    racer = threading.Thread(target=lambda: first.append(model_catalog._pi_own_login_listing()))
+    racer.start()
+    assert older_entered.wait(10)
+
+    second = model_catalog._pi_own_login_listing()
+    release_older.set()
+    racer.join(10)
+
+    assert (first, second) == ([older], newer)
+    assert model_catalog._pi_own_login_listing() is newer
