@@ -3624,3 +3624,142 @@ def test_pi_subscription_malformed_base_url_drops_only_that_provider(
     assert listing.source == "cli"
     assert _listed_ids(listing) == ["fallback/qwen"]
 
+
+def test_pi_subscription_enabled_models_globs_with_pis_resolver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pi's own resolver expands globs in catalog order and skips unmatched patterns."""
+    import shutil
+
+    if shutil.which("pi") is None or shutil.which("node") is None:
+        pytest.skip("needs the installed Pi CLI and Node for Pi's model resolver")
+    _isolate_config(monkeypatch, tmp_path, "")
+    _write_pi_agent_dir(
+        monkeypatch,
+        tmp_path / "pi",
+        {
+            "defaultProvider": "primary",
+            "enabledModels": ["fallback/sm*", "nomatch/*", "primary/*"],
+        },
+    )
+    _pi_endpoints(monkeypatch, down=set())
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(listing) == ["primary/small", "primary/large", "fallback/small"]
+
+
+def test_pi_subscription_unmatched_enabled_models_lists_full_inventory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Curation that matches nothing falls back to every model, as Pi itself does."""
+    from omnigent.harnesses.pi_native import credentials
+
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"enabledModels": ["nomatch/*"]})
+    _pi_endpoints(monkeypatch, down=set())
+    monkeypatch.setattr(credentials, "scope_models", lambda _patterns, _models: [])
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(listing) == [
+        "fallback/small",
+        "fallback/large",
+        "primary/small",
+        "primary/large",
+    ]
+
+
+def test_pi_subscription_dedupes_models_and_skips_empty_providers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A repeated model id lists once; a provider with no models is neither listed nor probed."""
+    _write_pi_providers(
+        monkeypatch,
+        tmp_path / "pi",
+        {
+            "primary": {"baseUrl": _PI_PRIMARY_URL, "models": [{"id": "qwen"}, {"id": "qwen"}]},
+            "empty": {"baseUrl": "http://empty.example.com/v1", "models": []},
+        },
+    )
+    probed = _pi_endpoints(monkeypatch, down=set())
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(listing) == ["primary/qwen"]
+    assert probed == [_PI_PRIMARY_URL]
+
+
+def test_pi_subscription_lists_login_providers_unprobed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A provider with no ``baseUrl`` (a Pi login) has nothing to probe and stays listed."""
+    root = tmp_path / "pi"
+    _write_pi_providers(
+        monkeypatch,
+        root,
+        {"primary": {"baseUrl": _PI_PRIMARY_URL, "models": [{"id": "qwen"}]}},
+        {"defaultProvider": "primary"},
+    )
+    (root / "auth.json").write_text(json.dumps({"cloud": {"type": "oauth"}}))
+    (root / "models-store.json").write_text(json.dumps({"cloud": {"models": [{"id": "big"}]}}))
+    probed = _pi_endpoints(monkeypatch, down={_PI_PRIMARY_URL})
+
+    listing = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(listing) == ["cloud/big"]
+    assert probed == [_PI_PRIMARY_URL]
+
+
+def test_pi_endpoint_probe_cache_expires_after_ttl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A down host is re-probed once the cache entry expires, and returns when it recovers."""
+    now = {"t": 1000.0}
+    monkeypatch.setattr(
+        model_catalog,
+        "_pi_endpoint_up_cache",
+        TTLCache(maxsize=64, ttl=model_catalog._PI_ENDPOINT_TTL_S, timer=lambda: now["t"]),
+    )
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"defaultProvider": "primary"})
+    down = {_PI_PRIMARY_URL}
+    probed: list[str] = []
+
+    def _probe(base_url: str) -> bool:
+        probed.append(base_url)
+        return base_url not in down
+
+    monkeypatch.setattr(model_catalog, "_pi_endpoint_up", _probe)
+
+    first = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+    down.clear()
+    now["t"] += model_catalog._PI_ENDPOINT_TTL_S - 1
+    cached = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+    now["t"] += 2
+    expired = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
+
+    assert _listed_ids(first)[0] == "fallback/small"
+    assert _listed_ids(cached) == _listed_ids(first)
+    assert _listed_ids(expired)[0] == "primary/small"
+    assert len(probed) == 4
+
+
+def test_pi_subscription_concurrent_cold_listings_agree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Concurrent cold catalog calls may probe twice but return the same correct listing."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"defaultProvider": "primary"})
+    probed = _pi_endpoints(monkeypatch, down={_PI_PRIMARY_URL})
+    start = threading.Barrier(4, timeout=5)
+
+    def _list(_index: int) -> list[str]:
+        start.wait()
+        return _listed_ids(model_catalog.listing_for_provider(_PI_SUBSCRIPTION))
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(_list, range(4)))
+
+    assert results == [["fallback/small", "fallback/large"]] * 4
+    assert 2 <= len(probed) <= 8
