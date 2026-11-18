@@ -11,6 +11,7 @@ Databricks credential mint is stubbed with the real
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -3746,6 +3747,11 @@ def test_pi_endpoint_probe_cache_expires_after_ttl(
         "_pi_endpoint_up_cache",
         TTLCache(maxsize=64, ttl=model_catalog._PI_ENDPOINT_TTL_S, timer=lambda: now["t"]),
     )
+    monkeypatch.setattr(
+        model_catalog,
+        "_pi_listing_cache",
+        TTLCache(maxsize=8, ttl=model_catalog._PI_LISTING_TTL_S, timer=lambda: now["t"]),
+    )
     _write_pi_agent_dir(monkeypatch, tmp_path / "pi", {"defaultProvider": "primary"})
     down = {_PI_PRIMARY_URL}
     probed: list[str] = []
@@ -3760,7 +3766,8 @@ def test_pi_endpoint_probe_cache_expires_after_ttl(
     down.clear()
     now["t"] += model_catalog._PI_ENDPOINT_TTL_S - 1
     cached = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
-    now["t"] += 2
+    # Past both the probe's TTL and the listing reuse window started at the last call.
+    now["t"] += model_catalog._PI_LISTING_TTL_S + 1
     expired = model_catalog.listing_for_provider(_PI_SUBSCRIPTION)
 
     assert _listed_ids(first)[0] == "fallback/small"
@@ -3792,10 +3799,12 @@ def test_pi_subscription_concurrent_cold_listings_agree(
 
 
 def _live_probe_threads(base_url: str) -> int:
-    """Count running probe threads for *base_url*."""
+    """Count running probe threads for *base_url* (named by its host:port)."""
     import threading
+    from urllib.parse import urlsplit
 
-    return sum(1 for t in threading.enumerate() if t.name == f"pi-endpoint-probe {base_url}")
+    name = f"pi-endpoint-probe {urlsplit(base_url).netloc}"
+    return sum(1 for t in threading.enumerate() if t.name == name)
 
 
 def test_pi_endpoint_probes_stay_bounded_against_trickling_endpoint(
@@ -3813,6 +3822,11 @@ def test_pi_endpoint_probes_stay_bounded_against_trickling_endpoint(
         model_catalog,
         "_pi_endpoint_up_cache",
         TTLCache(maxsize=64, ttl=model_catalog._PI_ENDPOINT_TTL_S, timer=lambda: now["t"]),
+    )
+    monkeypatch.setattr(
+        model_catalog,
+        "_pi_listing_cache",
+        TTLCache(maxsize=8, ttl=model_catalog._PI_LISTING_TTL_S, timer=lambda: now["t"]),
     )
     connections: set[object] = set()
     url, stop = _serve_raw([b"H"], interval=0.02, live=connections)
@@ -3849,18 +3863,19 @@ def test_pi_endpoint_probes_stay_bounded_against_trickling_endpoint(
     assert peak_connections <= 1
 
 
-def test_pi_listing_shares_one_deadline_across_resolver_and_probes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A slow ``enabledModels`` resolver eats into the probes' time, not the listing budget."""
+def _install_blocking_pi_resolver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[int]:
+    """Put a stand-in Pi CLI on ``PATH`` whose resolver blocks past any subprocess timeout.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    :returns: A list that gains one entry per resolver subprocess run.
+    """
     import shutil
 
     from omnigent.harnesses.pi_native import model_scope
 
     if shutil.which("node") is None:
         pytest.skip("needs Node to run the stand-in Pi resolver")
-    _isolate_config(monkeypatch, tmp_path, "")
-    # A stand-in Pi install whose resolver blocks far past its subprocess timeout.
     dist = tmp_path / "pi-cli" / "dist"
     (dist / "core").mkdir(parents=True)
     (dist / "cli.js").write_text("")
@@ -3874,6 +3889,23 @@ def test_pi_listing_shares_one_deadline_across_resolver_and_probes(
     (tmp_path / "bin" / "pi").symlink_to(dist / "cli.js")
     monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
     model_scope._scoped_indices.cache_clear()
+    runs: list[int] = []
+    resolve = model_scope._scoped_indices
+
+    def _counted(*args: object) -> tuple[int, ...]:
+        runs.append(1)
+        return resolve(*args)
+
+    monkeypatch.setattr(model_scope, "_scoped_indices", _counted)
+    return runs
+
+
+def test_pi_listing_shares_one_deadline_across_resolver_and_probes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A slow ``enabledModels`` resolver eats into the probes' time, not the listing budget."""
+    _isolate_config(monkeypatch, tmp_path, "")
+    _install_blocking_pi_resolver(monkeypatch, tmp_path)
     budget = model_catalog._PI_RESOLVER_TIMEOUT_S + 0.5
     monkeypatch.setattr(model_catalog, "_PI_LISTING_BUDGET_S", budget)
     trickle_url, stop = _serve_raw([b"H"], interval=0.02)
@@ -3898,3 +3930,78 @@ def test_pi_listing_shares_one_deadline_across_resolver_and_probes(
     # The resolver timed out, so Pi's full inventory stands; the trickling host is dropped.
     assert _listed_ids(listing) == ["fallback/qwen"]
     assert model_catalog._PI_RESOLVER_TIMEOUT_S <= elapsed < budget + 0.4
+
+
+def test_pi_catalog_rows_share_one_listing_within_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Several Pi rows in one catalog reuse one bounded listing; the slow resolver runs once."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  pi:\n    kind: subscription\n    cli: pi\n    default: pi\n",
+    )
+    runs = _install_blocking_pi_resolver(monkeypatch, tmp_path)
+    healthy_url, stop = _serve_raw([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"], 5)
+    _write_pi_providers(
+        monkeypatch,
+        tmp_path / "pi",
+        {"primary": {"baseUrl": healthy_url, "models": [{"id": "qwen"}]}},
+        {"enabledModels": ["primary/*"]},
+    )
+    parent = AgentSpec(
+        spec_version=1,
+        name="orchestrator",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi"}),
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                name=f"pi_{index}",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "pi"}),
+            )
+            for index in range(3)
+        ],
+    )
+    try:
+        started = time.monotonic()
+        catalog = catalog_for_spec(parent)
+        elapsed = time.monotonic() - started
+    finally:
+        stop()
+
+    assert runs == [1]
+    assert elapsed < model_catalog._PI_LISTING_BUDGET_S
+    for name in ("self", "pi_0", "pi_1", "pi_2"):
+        assert [model["id"] for model in catalog[name]["models"]] == ["primary/qwen"]
+
+
+def test_pi_connect_spends_one_deadline_across_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every address of a multi-address host shares the probe deadline, not one each."""
+    import socket
+
+    # A full listen backlog makes further connects hang, like a blackholed address.
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(0)
+    address = listener.getsockname()
+    fillers = []
+    for _ in range(4):
+        filler = socket.socket()
+        filler.setblocking(False)
+        with contextlib.suppress(BlockingIOError):
+            filler.connect(address)
+        fillers.append(filler)
+    blackholed = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", address)] * 3
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: blackholed)
+    budget = 0.6
+    try:
+        started = time.monotonic()
+        up = model_catalog._pi_endpoint_up("http://multi.example.com/v1", started + budget)
+        elapsed = time.monotonic() - started
+    finally:
+        for filler in fillers:
+            filler.close()
+        listener.close()
+
+    assert not up
+    assert elapsed < budget + 0.3

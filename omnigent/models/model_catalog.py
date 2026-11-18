@@ -407,6 +407,7 @@ def clear_model_catalog_cache() -> None:
         _listing_cache.clear()
     with _pi_endpoint_up_lock:
         _pi_endpoint_up_cache.clear()
+        _pi_listing_cache.clear()
 
 
 def model_family_token(model_id: str) -> str:
@@ -1516,6 +1517,33 @@ def _pi_time_left(deadline: float) -> float:
     return left
 
 
+def _pi_connect(host: str, port: int, deadline: float) -> socket.socket:
+    """Connect to the first of *host*'s addresses that accepts before *deadline*.
+
+    Unlike :func:`socket.create_connection`, whose timeout applies per address,
+    every attempt gets only the time left, so a multi-address host cannot
+    overrun the deadline.
+
+    :raises OSError: When no address accepted in time (``TimeoutError`` once spent).
+    """
+    error: OSError = ConnectionError(f"no address accepted for {host}")
+    for family, kind, proto, _name, address in socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM
+    ):
+        conn = socket.socket(family, kind, proto)
+        try:
+            conn.settimeout(_pi_time_left(deadline))
+            conn.connect(address)
+        except OSError as exc:
+            conn.close()
+            error = exc
+            if time.monotonic() >= deadline:
+                break
+            continue
+        return conn
+    raise error
+
+
 def _pi_endpoint_up(base_url: str, deadline: float | None = None) -> bool:
     """Report whether an HTTP(S) endpoint answers ``GET {base_url}/models`` by *deadline*.
 
@@ -1541,9 +1569,7 @@ def _pi_endpoint_up(base_url: str, deadline: float | None = None) -> bool:
             f"GET {target.path} HTTP/1.1\r\nHost: {target.netloc.rpartition('@')[2]}\r\n"
             "Accept: application/json\r\nConnection: close\r\n\r\n"
         ).encode()
-        with socket.create_connection(
-            (target.hostname, port), timeout=_pi_time_left(deadline)
-        ) as raw:
+        with _pi_connect(target.hostname, port, deadline) as raw:
             raw.settimeout(_pi_time_left(deadline))
             with (
                 ssl.create_default_context().wrap_socket(raw, server_hostname=target.hostname)
@@ -1583,7 +1609,9 @@ def _pi_start_probe(base_url: str, deadline: float) -> _PiProbe:
                 _pi_probes_in_flight.pop(base_url, None)
             probe.done.set()
 
-    threading.Thread(target=_run, name=f"pi-endpoint-probe {base_url}", daemon=True).start()
+    # Name by host:port only: a baseUrl's userinfo or query must not reach thread dumps.
+    host_port = urlsplit(base_url).netloc.rpartition("@")[2]
+    threading.Thread(target=_run, name=f"pi-endpoint-probe {host_port}", daemon=True).start()
     return probe
 
 
@@ -1610,7 +1638,33 @@ def _pi_live_endpoints(base_urls: set[str], deadline: float) -> set[str]:
     return {url for url, up in known.items() if up}
 
 
+#: Reuse one Pi listing (resolver outcome included) across a catalog call's Pi rows.
+_PI_LISTING_TTL_S = 5.0
+_pi_listing_cache: TTLCache[str, tuple[ModelListing | None]] = TTLCache(
+    maxsize=8, ttl=_PI_LISTING_TTL_S
+)
+
+
 def _pi_own_login_listing() -> ModelListing | None:
+    """Pi's own-login listing, reused for :data:`_PI_LISTING_TTL_S` per Pi agent dir.
+
+    A catalog builds worker rows one after another, so without reuse every Pi
+    row would spend its own :data:`_PI_LISTING_BUDGET_S`.
+    """
+    from omnigent.harnesses.pi_native.credentials import global_pi_agent_dir
+
+    key = str(global_pi_agent_dir())
+    with _pi_endpoint_up_lock:
+        cached = _pi_listing_cache.get(key)
+    if cached is not None:
+        return cached[0]
+    listing = _build_pi_own_login_listing()
+    with _pi_endpoint_up_lock:
+        _pi_listing_cache[key] = (listing,)
+    return listing
+
+
+def _build_pi_own_login_listing() -> ModelListing | None:
     """List the models a Pi on its own login can address, from Pi's own config.
 
     Providers whose ``baseUrl`` does not answer are dropped, so routing falls
