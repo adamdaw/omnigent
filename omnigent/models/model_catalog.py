@@ -37,6 +37,7 @@ import os
 import re
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 from urllib.parse import urlsplit
@@ -399,6 +400,8 @@ def clear_model_catalog_cache() -> None:
     """
     with _listing_cache_lock:
         _listing_cache.clear()
+    with _pi_endpoint_up_lock:
+        _pi_endpoint_up_cache.clear()
 
 
 def model_family_token(model_id: str) -> str:
@@ -1454,9 +1457,15 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
     source of truth, so a path that cannot probe reports nothing rather
     than a plausible-but-stale list.
 
+    Pi is the exception: its own config declares its models before launch.
+
     :param provider: A ``kind="subscription"`` provider descriptor.
-    :returns: A ``source="static"`` listing with no models.
+    :returns: A ``source="static"`` listing with no models, or Pi's own listing.
     """
+    if provider.cli == "pi":
+        pi_listing = _pi_own_login_listing()
+        if pi_listing is not None:
+            return pi_listing
     return ModelListing(
         source="static",
         verified=False,
@@ -1465,6 +1474,75 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
             f"the {provider.cli or 'unknown'} CLI login exposes no model-listing "
             "API before launch; the live listing comes from probing the harness"
         ),
+    )
+
+
+#: How long a Pi provider endpoint's reachability is reused; short so a recovered host returns.
+_PI_ENDPOINT_TTL_S = 30.0
+#: Per-phase (connect, read) budget for one Pi endpoint probe.
+_PI_ENDPOINT_TIMEOUT_S = 1.0
+_pi_endpoint_up_cache: TTLCache[str, bool] = TTLCache(maxsize=64, ttl=_PI_ENDPOINT_TTL_S)
+_pi_endpoint_up_lock = threading.Lock()
+
+
+def _pi_endpoint_up(base_url: str) -> bool:
+    """Report whether an OpenAI-compatible endpoint answers ``GET {base_url}/models``.
+
+    Any HTTP response counts: the server is up even when it rejects the request.
+    """
+    try:
+        httpx.get(f"{base_url.rstrip('/')}/models", timeout=_PI_ENDPOINT_TIMEOUT_S)
+    except httpx.HTTPError:
+        return False
+    return True
+
+
+def _pi_live_endpoints(base_urls: set[str]) -> set[str]:
+    """Return the reachable subset of *base_urls*, probing uncached ones concurrently.
+
+    Concurrent probes bound a cold call to one probe's budget (~2 s worst case),
+    inside the server's 5 s catalog limit; results are cached for
+    :data:`_PI_ENDPOINT_TTL_S`.
+    """
+    with _pi_endpoint_up_lock:
+        known = {url: _pi_endpoint_up_cache.get(url) for url in base_urls}
+    unknown = [url for url, up in known.items() if up is None]
+    if unknown:
+        with ThreadPoolExecutor(max_workers=len(unknown)) as pool:
+            probed = dict(zip(unknown, pool.map(_pi_endpoint_up, unknown), strict=True))
+        with _pi_endpoint_up_lock:
+            _pi_endpoint_up_cache.update(probed)
+        known.update(probed)
+    return {url for url, up in known.items() if up}
+
+
+def _pi_own_login_listing() -> ModelListing | None:
+    """List the models a Pi on its own login can address, from Pi's own config.
+
+    Providers whose ``baseUrl`` does not answer are dropped, so routing falls
+    through to the next provider (``pollux/*`` down -> ``llamaswap/*`` first).
+
+    :returns: A ``source="cli"`` listing, or ``None`` when Pi declares no
+        reachable models (the caller keeps the empty pre-launch listing).
+    """
+    from omnigent.harnesses.pi_native.credentials import pi_own_login_routing_models
+
+    entries, base_urls = pi_own_login_routing_models()
+    live = _pi_live_endpoints({base_urls[e.provider] for e in entries if e.provider in base_urls})
+    ids = [
+        entry.reference
+        for entry in entries
+        if entry.provider not in base_urls or base_urls[entry.provider] in live
+    ]
+    if not ids:
+        return None
+    return ModelListing(
+        source="cli",
+        verified=False,
+        models=tuple(
+            ModelEntry(id=model_id, family=model_family_token(model_id)) for model_id in ids
+        ),
+        note="models declared in Pi's own config (models.json, logins, settings.json)",
     )
 
 
