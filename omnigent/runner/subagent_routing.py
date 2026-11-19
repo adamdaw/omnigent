@@ -115,6 +115,12 @@ CREATE_ROUTE_PROMPT_LABEL_KEY = "omnigent.routing.create_prompt"
 #: may still move this session's subagents across harness families.
 AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness"
 
+#: Conversation label marking a session whose spec pins its brain under Smart
+#: Routing (``executor.config.smart_routing_harness: pinned``). The brain keeps
+#: its declared harness and model; only its sub-agent dispatches are routed,
+#: and a declared worker may run in another family. Server-stamped at create.
+PINNED_BRAIN_LABEL_KEY = "omnigent.routing.pinned_brain"
+
 _SCOPE = "native_subagent"
 _PROMPT_CAP = 4000
 #: Task label scored for a codex spawn that carries no prompt and no
@@ -279,10 +285,12 @@ def routing_class_from_snapshot(
     # launch omits it instead of registering a per-prompt round trip. A create
     # whose routing failed stamps nothing, and keeps the hook as its retry.
     already_routed = bool(labels is not None and labels.get(ROUTING_DECISION_LABEL_KEY))
+    # A pinned brain is never model-routed itself; only its spawns are.
+    pinned_brain = bool(labels is not None and labels.get(PINNED_BRAIN_LABEL_KEY) == "1")
     return SessionRoutingClass(
         routing_enabled=routes,
         auto_harness=auto,
-        turn_routing=routes and not already_routed,
+        turn_routing=routes and not already_routed and not pinned_brain,
     )
 
 
@@ -530,6 +538,32 @@ def auto_harness_session(conv: Any, parent: Any = None) -> bool:
         if getattr(row, "harness_override", None) == "auto":
             return True
     return False
+
+
+def pinned_brain_session(conv: Any) -> bool:
+    """Report whether a session pins its own brain under Smart Routing.
+
+    :param conv: Conversation row, or ``None``.
+    :returns: ``True`` when the row carries :data:`PINNED_BRAIN_LABEL_KEY`.
+    """
+    labels = getattr(conv, "labels", None) or {}
+    return labels.get(PINNED_BRAIN_LABEL_KEY) == "1"
+
+
+def declared_worker_of_pinned_brain(conv: Any, parent: Any) -> bool:
+    """Report whether *conv* is a declared worker of a pinned-brain parent.
+
+    Such a worker may run in another model family than its parent: the
+    parent's spec chose the worker's harness, and the worker is routed on it.
+
+    :param conv: The child session's row, or ``None``.
+    :param parent: The parent session's row, or ``None``.
+    :returns: ``True`` when the parent pins its brain and the child is one of
+        its named sub-agents.
+    """
+    if conv is None or not pinned_brain_session(parent):
+        return False
+    return bool(getattr(conv, "sub_agent_name", None))
 
 
 def model_in_family(family: str | None, model: str) -> bool:

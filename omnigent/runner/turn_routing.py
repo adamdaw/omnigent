@@ -487,6 +487,7 @@ def out_of_parent_family(
     """
     from omnigent.runner.subagent_routing import (
         auto_harness_session,
+        declared_worker_of_pinned_brain,
         harness_family,
         subagent_routing_enabled,
     )
@@ -495,7 +496,7 @@ def out_of_parent_family(
         return False
     if not subagent_routing_enabled(getattr(parent, "subagent_routing_override", None)):
         return False
-    if auto_harness_session(conv, parent):
+    if auto_harness_session(conv, parent) or declared_worker_of_pinned_brain(conv, parent):
         return False
     parent_family = harness_family(parent_harness)
     own_family = harness_family(harness)

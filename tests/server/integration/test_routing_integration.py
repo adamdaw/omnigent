@@ -19,6 +19,7 @@ import pytest
 from omnigent.runner import subagent_routing
 from omnigent.runner.subagent_routing import (
     AUTO_HARNESS_LABEL_KEY,
+    PINNED_BRAIN_LABEL_KEY,
     ROUTING_DECISION_LABEL_KEY,
 )
 from omnigent.server.routes._sessions import orchestration as orchestration_module
@@ -1283,6 +1284,167 @@ async def test_plain_parent_may_create_a_child_in_another_family(
     assert child.status_code == 201, child.text
 
 
+# ── 7d. A pinned brain routes its declared workers, not itself ─────
+
+
+async def _pinned_brain_parent(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    *,
+    agent_name: str,
+    smart_routing_harness: str | None,
+) -> tuple[dict[str, Any], Any, SqlAlchemyConversationStore]:
+    """Create a Smart Routing session of a polly-shaped claude-sdk brain.
+
+    Its ``pi`` and ``codex`` workers each declare a harness outside the
+    brain's claude family.
+
+    :param client: Test HTTP client.
+    :param db_uri: Database URI for a direct store handle.
+    :param agent_name: Agent name to register.
+    :param smart_routing_harness: The spec's ``smart_routing_harness``, or
+        ``None`` for a bundle without the opt-in.
+    :returns: ``(agent, parent_conversation, conversation_store)``.
+    """
+    config: dict[str, Any] = {"harness": "claude-sdk"}
+    if smart_routing_harness is not None:
+        config["smart_routing_harness"] = smart_routing_harness
+    agent = await create_test_agent(
+        client,
+        name=agent_name,
+        executor={"type": "omnigent", "config": config},
+        sub_agents=[
+            {"name": "pi", "executor": {"type": "omnigent", "config": {"harness": "pi"}}},
+            {"name": "codex", "executor": {"type": "omnigent", "config": {"harness": "codex"}}},
+        ],
+    )
+    parent = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert parent.status_code == 201, parent.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent_conv = conv_store.get_conversation(str(parent.json()["id"]))
+    assert parent_conv is not None
+    return agent, parent_conv, conv_store
+
+
+async def test_a_pinned_brain_is_not_rerouted(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _agent, parent, conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-not-rerouted", smart_routing_harness="pinned"
+    )
+    # The brain keeps its declared harness, and its spawns are routed.
+    assert parent.harness_override is None
+    assert AUTO_HARNESS_LABEL_KEY not in parent.labels
+    assert parent.labels.get(PINNED_BRAIN_LABEL_KEY) == "1"
+    assert parent.subagent_routing_override == "on"
+
+    routing_client = FakeRoutingClient(RoutingResult(model=ROUTED_MODEL, rationale="cheap"))
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "plan the work"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                parent.id, parent, body, conv_store, runner_client
+            )
+
+    assert routing_client.calls == []
+    refreshed = conv_store.get_conversation(parent.id)
+    assert refreshed is not None
+    assert refreshed.model_override is None
+    assert _routing_decisions(conv_store, parent.id) == []
+
+
+@pytest.mark.parametrize(
+    ("smart_routing_harness", "worker", "harness", "expected_status"),
+    [
+        ("pinned", "pi", "pi", 201),
+        ("pinned", "codex", "codex", 201),
+        # Without the opt-in the family rule refuses the same dispatches.
+        (None, "pi", "pi", 400),
+        (None, "codex", "codex", 400),
+        # Only the harness the worker declares crosses the family line.
+        ("pinned", "pi", "codex", 400),
+    ],
+)
+async def test_a_pinned_brain_may_dispatch_a_declared_worker_in_another_family(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    smart_routing_harness: str | None,
+    worker: str,
+    harness: str,
+    expected_status: int,
+) -> None:
+    agent, parent, conv_store = await _pinned_brain_parent(
+        client,
+        db_uri,
+        agent_name=f"pinned-brain-{smart_routing_harness}-{worker}-{harness}",
+        smart_routing_harness=smart_routing_harness,
+    )
+    child = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent.id,
+            "sub_agent_name": worker,
+            "harness_override": harness,
+            "title": f"{worker}:{harness}",
+        },
+    )
+    assert child.status_code == expected_status, child.text
+    if expected_status != 201:
+        assert "model family" in child.text
+        return
+
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+    assert child_conv.harness_override == harness
+    routing_client = FakeRoutingClient(RoutingResult(model=ROUTED_MODEL, rationale="cheap"))
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "review the diff"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child_conv.id, child_conv, body, conv_store, runner_client
+            )
+    # The dispatch is routed, on the worker's own harness.
+    assert set(routing_client.offered[0]) == {harness}
+
+
+async def test_a_pinned_brain_still_refuses_an_undeclared_cross_family_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _agent, parent, _conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-undeclared", smart_routing_harness="pinned"
+    )
+    child = await _create_child(
+        client, parent.id, agent_name="pinned-brain-undeclared-codex", harness="codex"
+    )
+    assert child.status_code == 400, child.text
+    assert "model family" in child.text
+
+
+async def test_a_client_cannot_seed_the_pinned_brain_label(client: httpx.AsyncClient) -> None:
+    agent = await create_test_agent(
+        client,
+        name="pinned-brain-forged-label",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "labels": {PINNED_BRAIN_LABEL_KEY: "1"}},
+    )
+    assert resp.status_code == 400, resp.text
+
+
 # ── 8. Truthful record on a claude-native turn ─────────────────────
 
 
@@ -1550,6 +1712,8 @@ async def _parent_with_native_child_pane(
     agent_name: str,
     parent_harness: str,
     auto: bool,
+    smart_routing_harness: str | None = None,
+    sub_agent_name: str | None = None,
 ) -> tuple[str, Any, SqlAlchemyConversationStore]:
     """A routing-on parent plus a claude-native sub-agent pane under it.
 
@@ -1564,14 +1728,19 @@ async def _parent_with_native_child_pane(
     :param parent_harness: The parent agent's harness, e.g. ``"codex"``.
     :param auto: ``True`` to start the parent in Smart Routing (auto) harness
         mode, the only mode allowed cross-family spawns.
+    :param smart_routing_harness: The parent spec's ``smart_routing_harness``.
+    :param sub_agent_name: The pane's declared worker name, if any.
     :returns: ``(parent_id, child_conversation, conversation_store)``.
     """
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
 
+    parent_config = {"harness": parent_harness}
+    if smart_routing_harness is not None:
+        parent_config["smart_routing_harness"] = smart_routing_harness
     agent = await create_test_agent(
         client,
         name=agent_name,
-        executor={"type": "omnigent", "config": {"harness": parent_harness}},
+        executor={"type": "omnigent", "config": parent_config},
     )
     # The spawned child is bound to another family's native wrapper, exactly as
     # a ``sys_session_create`` that named ``claude-native-ui`` leaves it.
@@ -1602,6 +1771,7 @@ async def _parent_with_native_child_pane(
         title="claude-native-ui:say hello",
         parent_conversation_id=parent_id,
         agent_id=child_agent["id"],
+        sub_agent_name=sub_agent_name,
     )
     conv_store.set_labels(
         child.id,
@@ -1659,6 +1829,52 @@ async def test_a_pinned_parents_child_pane_is_never_routed_onto_another_family(
     assert [f.get("model_override") for f in forwarded] == [None]
     # The spawn still ran: the message reached the terminal.
     assert forwarded
+
+
+@pytest.mark.parametrize(
+    ("smart_routing_harness", "sub_agent_name", "routed"),
+    [
+        # A pinned-brain parent's declared worker runs in its own family.
+        ("pinned", "claude_code", True),
+        # Without the opt-in the family rule still holds for the same worker.
+        (None, "claude_code", False),
+        # A pinned brain does not free an undeclared spawn.
+        ("pinned", None, False),
+    ],
+    ids=["pinned-brain-worker", "no-opt-in", "pinned-brain-undeclared"],
+)
+async def test_a_pinned_brain_routes_its_declared_cross_family_worker_pane(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    smart_routing_harness: str | None,
+    sub_agent_name: str | None,
+    routed: bool,
+) -> None:
+    _parent_id, child, conv_store = await _parent_with_native_child_pane(
+        client,
+        db_uri,
+        agent_name=f"routing-child-pane-brain-{smart_routing_harness}-{sub_agent_name}",
+        parent_harness="codex",
+        auto=False,
+        smart_routing_harness=smart_routing_harness,
+        sub_agent_name=sub_agent_name,
+    )
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=ROUTED_MODEL, rationale="escalate", harness="claude_code")
+    )
+
+    data, _forwarded = await _dispatch_native_turn(
+        child, conv_store, model=ROUTED_MODEL, routing_client=routing_client
+    )
+
+    assert data.applied is routed
+    if routed:
+        # Routed on the pane's own harness, never the brain's.
+        assert set(routing_client.offered[0]) == {"claude-native"}
+        assert data.model == ROUTED_MODEL
+    else:
+        assert routing_client.calls == []
+        assert "stay in its own model family" in data.rationale
 
 
 async def test_an_auto_parents_child_pane_still_routes_across_families(
