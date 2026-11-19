@@ -1173,6 +1173,13 @@ def list_models_for_worker(
 
     binding = binding_for_harness(load_runtime_inference_config(), harness)
     if binding is not None:
+        # A native worker bound to its CLI subscription lists that login's probe catalog.
+        if (
+            not listing.models
+            and provider.kind == SUBSCRIPTION_KIND
+            and (canonicalize_harness(harness) or harness) in _NATIVE_PROBE_CLI
+        ):
+            listing = _cli_login_probe_listing(spec, harness, provider) or listing
         if binding.model_allowlist is None:
             return listing
         by_id = {model.id: model for model in listing.models}

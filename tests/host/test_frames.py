@@ -60,6 +60,7 @@ from omnigent.host.frames import (
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
     HostProbeAccountsResultFrame,
+    HostRecoverSessionsFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
@@ -904,17 +905,23 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
 
 def test_hello_frame_capabilities_round_trip() -> None:
     """Advertised capability tokens survive encode → decode."""
-    from omnigent.host.frames import CAP_CODEX_SIDE_CHAT
+    from omnigent.host.frames import (
+        CAP_CODEX_SIDE_CHAT,
+        CAP_CODEX_SIDE_CHAT_RESUME,
+        HOST_CAPABILITIES,
+    )
+
+    assert CAP_CODEX_SIDE_CHAT_RESUME in HOST_CAPABILITIES
 
     original = HostHelloFrame(
         version="0.1.0",
         frame_protocol_version=1,
         name="new-host",
-        capabilities=[CAP_CODEX_SIDE_CHAT],
+        capabilities=[CAP_CODEX_SIDE_CHAT, CAP_CODEX_SIDE_CHAT_RESUME],
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
-    assert decoded.capabilities == [CAP_CODEX_SIDE_CHAT]
+    assert decoded.capabilities == [CAP_CODEX_SIDE_CHAT, CAP_CODEX_SIDE_CHAT_RESUME]
 
 
 def test_hello_frame_empty_runners() -> None:
@@ -933,7 +940,8 @@ def test_hello_frame_empty_runners() -> None:
     assert decoded.runners == []
 
 
-def test_launch_runner_frame_round_trip() -> None:
+@pytest.mark.parametrize("recovery", [False, True])
+def test_launch_runner_frame_round_trip(recovery: bool) -> None:
     """
     Verify HostLaunchRunnerFrame survives encode → decode.
 
@@ -945,6 +953,7 @@ def test_launch_runner_frame_round_trip() -> None:
         binding_token="secret_token_xyz",
         workspace="/Users/corey/projects/frontend",
         session_id="conv_abc123",
+        recovery=recovery,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerFrame)
@@ -952,6 +961,7 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"
     assert decoded.session_id == "conv_abc123"
+    assert decoded.recovery is recovery
 
 
 def test_launch_runner_superseded_runner_ids_round_trip() -> None:
@@ -1273,7 +1283,26 @@ def test_unresponsive_cli_readiness_stays_decodable_by_older_servers(
     )
     legacy = decode_host_frame(json.dumps(legacy_payload))
     assert isinstance(legacy, type(frame))
-    assert legacy.configured_harnesses == {"pi": "version-too-low", "codex": "binary-missing"}
+    assert legacy.configured_harnesses == {"pi": True, "codex": "binary-missing"}
+    # 0.21.0's harness_launch_availability, which knows no advisory CLI state:
+    # anything but True or needs-auth blocks the launch.
+    assert _v0_21_0_launch_availability("pi", legacy.configured_harnesses) == (True, None)
+    assert _v0_21_0_launch_availability("codex", legacy.configured_harnesses) == (
+        False,
+        "binary-missing",
+    )
+
+
+def _v0_21_0_launch_availability(
+    harness: str, readiness: dict[str, HarnessAvailability] | None
+) -> tuple[bool | None, str | None]:
+    """Replay omnigent 0.21.0's ``harness_launch_availability`` for a canonical harness name."""
+    value = (readiness or {}).get(harness)
+    if value is True:
+        return True, None
+    if value is False or value is None:
+        return False, "unconfigured"
+    return (None if value == "needs-auth" else False), value
 
 
 @pytest.mark.parametrize("frame_kind", sorted(_READINESS_FRAME_FACTORIES))
@@ -3114,3 +3143,22 @@ def test_workspace_call_and_reply_frames_round_trip_bytes() -> None:
     assert decode_host_frame(encode_host_frame(call)) == call
     assert decode_host_frame(encode_host_frame(reply)) == reply
     assert decode_host_frame(encode_host_frame(end)) == end
+
+
+def test_recovery_request_round_trip_and_legacy_hello_default() -> None:
+    frame = HostRecoverSessionsFrame(runners=["alive-runner"])
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+    hello = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "test",
+                "frame_protocol_version": 1,
+                "name": "sandbox",
+            }
+        )
+    )
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.recover_interrupted_sessions is False
+    hello.recover_interrupted_sessions = True
+    assert decode_host_frame(encode_host_frame(hello)).recover_interrupted_sessions is True
