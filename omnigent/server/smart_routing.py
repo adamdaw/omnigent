@@ -1540,6 +1540,8 @@ class TaskV1RouteOptionSource:
         pick: RoutePick,
         harnesses: Sequence[str],
         catalog: dict[str, list[str]],
+        *,
+        gateway_backed: bool = True,
     ) -> ResolvedRoute | None:
         """Translate *pick* into a servable (harness, model) pair.
 
@@ -1557,6 +1559,11 @@ class TaskV1RouteOptionSource:
         harness = harness_for_model(
             raw, catalog, harnesses=harnesses, prefixes=self._model_prefixes
         )
+        if not gateway_backed:
+            local = self._local_id(raw, harness, catalog) if harness is not None else None
+            if local is None:
+                return None
+            return ResolvedRoute(model=local, harness=harness, raw_model=raw)
         if harness is None:
             # No offered harness runs the pick itself: keep the harness it would
             # have landed on (a child must not leave its family) and swap the
@@ -1575,7 +1582,11 @@ class TaskV1RouteOptionSource:
         if local is None:
             return None
         return ResolvedRoute(
-            model=apply_servable_alias(local, self._model_prefixes, aliases=self._aliases),
+            model=(
+                apply_servable_alias(local, self._model_prefixes, aliases=self._aliases)
+                if gateway_backed
+                else local
+            ),
             harness=harness,
             raw_model=raw,
         )
@@ -1929,9 +1940,30 @@ class ExternalRoutingClient:
         return _config_bearer(self._ambient_config, "the ambient Databricks environment")
 
     async def route(
+        self, message: str, available_models: dict[str, list[str]]
+    ) -> RoutingResult | None:
+        return await self.route_for_gateway(message, available_models, gateway_backed=True)
+
+    async def route_for_gateway(
+        self, message: str, available_models: dict[str, list[str]], *, gateway_backed: bool
+    ) -> RoutingResult | None:
+        import asyncio
+
+        try:
+            return await asyncio.wait_for(
+                self._route(message, available_models, gateway_backed=gateway_backed),
+                timeout=self._request_timeout,
+            )
+        except TimeoutError:
+            self.last_error = "router request timed out"
+            return None
+
+    async def _route(
         self,
         message: str,
         available_models: dict[str, list[str]],
+        *,
+        gateway_backed: bool,
     ) -> RoutingResult | None:
         import httpx
         from google.protobuf import json_format
@@ -2055,6 +2087,7 @@ class ExternalRoutingClient:
             RoutePick(model=selected.model, harness=selected.harness or None),
             harnesses,
             available_models,
+            gateway_backed=gateway_backed,
         )
         if resolved is None:
             _logger.warning(
@@ -2529,7 +2562,7 @@ async def route_turn(
         None,
     )
     if catalog_model is not None:
-        model = apply_servable_alias(catalog_model, prefixes)
+        model = apply_servable_alias(catalog_model, prefixes) if gateway_backed else catalog_model
     if harness_bars_model(harness, model, prefixes=prefixes):
         substitute = substitute_model(
             raw_model or model,

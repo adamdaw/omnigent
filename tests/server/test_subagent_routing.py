@@ -1500,6 +1500,18 @@ async def test_opted_in_external_routes_off_gateway_spawn() -> None:
     decision = await resolve_subagent_route(
         "conv_optin", _request(), caps=caps, gateway_backed=False
     )
-    assert decision.router_source == "databricks-aigw"
+    assert decision.router_source == "external"
     assert external.calls
     assert not local.calls
+
+
+def test_off_gateway_candidates_keep_catalog_spelling_without_gateway_arms() -> None:
+    from omnigent.runner.subagent_routing import candidate_models
+
+    offered = candidate_models(
+        "codex-native",
+        catalog={"self": ["glm-5-2"]},
+        gateway_backed=False,
+        allow_static_fallback=False,
+    )
+    assert offered == {"codex-native": ["glm-5-2"]}

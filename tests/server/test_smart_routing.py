@@ -3756,7 +3756,7 @@ async def test_opted_in_external_receives_off_gateway_session_catalog() -> None:
             allow_static_fallback=False,
         )
     assert (harness, model, error) == ("claude-native", "claude-sonnet-4-6", None)
-    assert verdict is not None and verdict["router_source"] == "databricks-aigw"
+    assert verdict is not None and verdict["router_source"] == "external"
     assert external.offered == [catalog]
     assert not local.offered
 
@@ -3798,3 +3798,65 @@ async def test_winnow_rejects_unoffered_pick_and_falls_back() -> None:
         "gpt-5-5",
     }
     assert local.offered == [catalog]
+
+
+@pytest.mark.asyncio
+async def test_external_total_timeout_leaves_time_for_judge() -> None:
+    import asyncio
+
+    import httpx
+
+    from omnigent.server.routing_backend import route_with_fallback
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    async def slow(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.3)
+        return httpx.Response(200, json={})
+
+    external = ExternalRoutingClient(
+        base_url="https://router.invalid", router_name="winnow", request_timeout=0.05
+    )
+    local = FakeRoutingClient(RoutingResult(model="pollux/qwen", rationale="judge"))
+    with _patch_httpx(httpx.MockTransport(slow)):
+        call = await asyncio.wait_for(
+            route_with_fallback(
+                RoutingBackends(external=external, local=local, non_gateway=True),
+                "hi",
+                {"pi": ["pollux/qwen"]},
+                gateway_backed=False,
+            ),
+            timeout=0.2,
+        )
+    assert call is not None and call.result is not None and call.result.rationale == "judge"
+
+
+@pytest.mark.asyncio
+async def test_opted_in_external_routes_off_gateway_turn_without_alias() -> None:
+    external = FakeRoutingClient(RoutingResult(model="glm-5-2", rationale="external"))
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, non_gateway=True),
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, verdict = await route_turn(
+            "codex-native",
+            "hello",
+            catalog=["glm-5-2"],
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert model == "glm-5-2"
+    assert verdict is not None and verdict["router_source"] == "external"
+
+
+def test_off_gateway_external_selection_keeps_offered_spelling() -> None:
+    from omnigent.server.smart_routing import RoutePick
+
+    source = TaskV1RouteOptionSource(router_name="winnow")
+    selection = source.resolve_selection(
+        RoutePick(model="glm-5-2"),
+        ["codex-native"],
+        {"codex-native": ["glm-5-2"]},
+        gateway_backed=False,
+    )
+    assert selection is not None and selection.model == "glm-5-2"

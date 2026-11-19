@@ -328,26 +328,29 @@ def _sources_caps(*, external: bool, local: bool, factory: bool) -> object:
         # Nothing configured at all.
         (
             _sources_caps(external=False, local=False, factory=False),
-            {"external": False, "oss": False},
+            {"external": False, "oss": False, "external_non_gateway": False},
         ),
         # The workspace Unity Gateway alone: no fallback for an ungatewayed harness.
         (
             _sources_caps(external=True, local=False, factory=False),
-            {"external": True, "oss": False},
+            {"external": True, "oss": False, "external_non_gateway": False},
         ),
         # The built-in judge alone.
         (
             _sources_caps(external=False, local=True, factory=False),
-            {"external": False, "oss": True},
+            {"external": False, "oss": True, "external_non_gateway": False},
         ),
         # Both — the normal Databricks posture, and the only one that can serve
         # a gateway-backed AND an ungatewayed harness.
-        (_sources_caps(external=True, local=True, factory=False), {"external": True, "oss": True}),
+        (
+            _sources_caps(external=True, local=True, factory=False),
+            {"external": True, "oss": True, "external_non_gateway": False},
+        ),
         # A managed deployment supplies its own client from the factory; that
         # counts as an OSS source, exactly as smart_routing_enabled treats it.
         (
             _sources_caps(external=False, local=False, factory=True),
-            {"external": False, "oss": True},
+            {"external": False, "oss": True, "external_non_gateway": False},
         ),
     ],
 )
@@ -389,7 +392,11 @@ async def test_info_reports_routing_on_for_a_backends_only_deployment(
     resp = await client.get("/v1/info")
     data = resp.json()
     assert data["smart_routing_enabled"] is True
-    assert data["smart_routing_sources"] == {"external": True, "oss": False}
+    assert data["smart_routing_sources"] == {
+        "external": True,
+        "oss": False,
+        "external_non_gateway": False,
+    }
 
 
 async def test_info_classifies_a_legacy_single_routing_client_as_the_oss_judge(
@@ -410,7 +417,11 @@ async def test_info_classifies_a_legacy_single_routing_client_as_the_oss_judge(
     resp = await client.get("/v1/info")
     data = resp.json()
     assert data["smart_routing_enabled"] is True
-    assert data["smart_routing_sources"] == {"external": False, "oss": True}
+    assert data["smart_routing_sources"] == {
+        "external": False,
+        "oss": True,
+        "external_non_gateway": False,
+    }
 
 
 # ── GET /v1/me ───────────────────────────────────────────
@@ -425,3 +436,26 @@ async def test_me_returns_null_user_without_auth(client: httpx.AsyncClient) -> N
     # is_admin is always present (mode-agnostic admin signal) and false
     # for an unauthenticated / no-permission-store caller.
     assert data["is_admin"] is False
+
+
+async def test_info_advertises_opted_in_external_non_gateway(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routing_backend import RoutingBackends
+
+    backends = RoutingBackends(external=_external_client(), non_gateway=True)
+    monkeypatch.setattr(
+        "omnigent.runtime._globals._caps",
+        SimpleNamespace(
+            routing_backends=backends,
+            routing_client=backends.external,
+            policy_llm_connection_factory=None,
+        ),
+        raising=False,
+    )
+    response = await client.get("/v1/info")
+    assert response.json()["smart_routing_sources"] == {
+        "external": True,
+        "oss": False,
+        "external_non_gateway": True,
+    }

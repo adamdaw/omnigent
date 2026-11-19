@@ -391,7 +391,29 @@ def _build_external_routing_client(
         selection_model=settings.selection_model,
         menus=settings.menus,
         servable_aliases=settings.servable_aliases,
+        request_timeout=_external_request_timeout(routing_cfg),
     )
+
+
+def _external_request_timeout(routing_cfg: dict[str, Any]) -> float:
+    value = routing_cfg.get(
+        "request_timeout", 3.0 if routing_cfg.get("non_gateway") is True else 9.0
+    )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or (not 0 < value <= 3.0 and routing_cfg.get("non_gateway") is True)
+    ):
+        click.echo(
+            "routing.request_timeout must be positive and at most 3 seconds "
+            "when non_gateway is enabled; using default",
+            err=True,
+        )
+        return 3.0 if routing_cfg.get("non_gateway") is True else 9.0
+    if value <= 0:
+        click.echo("routing.request_timeout must be positive; using default", err=True)
+        return 9.0
+    return float(value)
 
 
 def _build_local_llm_routing_client(
@@ -426,9 +448,9 @@ def _build_routing_backends(
 ) -> Any:  # type: ignore[explicit-any]  # RoutingBackends
     """Build BOTH routing backends from configuration alone — no opt-in env needed.
 
-    They are not alternatives. The external client's picks are Unity Gateway catalog
-    ids, so a harness whose inference runs off something else is served by the
-    built-in judge instead (see :mod:`omnigent.server.routing_backend`).
+    By default the external client returns Unity Gateway ids, so off-gateway
+    harnesses use the judge. An external router explicitly configured with
+    ``non_gateway: true`` may instead route their actual catalog.
 
     An explicit ``routing:`` block chooses the external side by ``provider``:
 
@@ -449,6 +471,21 @@ def _build_routing_backends(
 
     routing_cfg = cfg.get("routing")
     provider = routing_cfg.get("provider") if isinstance(routing_cfg, dict) else None
+    if isinstance(routing_cfg, dict):
+        from difflib import get_close_matches
+
+        for key in routing_cfg:
+            if (
+                isinstance(key, str)
+                and key != "non_gateway"
+                and get_close_matches(key, ["non_gateway"], n=1, cutoff=0.8)
+            ):
+                click.echo(f"Unknown routing setting {key!r}; did you mean non_gateway?", err=True)
+    if isinstance(routing_cfg, dict) and "non_gateway" in routing_cfg:
+        if not isinstance(routing_cfg["non_gateway"], bool) or provider != "external":
+            click.echo(
+                "routing.non_gateway requires a boolean and provider=external; ignoring", err=True
+            )
     if provider == "none":
         return RoutingBackends()
     external: Any = None  # type: ignore[explicit-any]

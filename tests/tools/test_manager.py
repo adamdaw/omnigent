@@ -1795,3 +1795,29 @@ def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
         "sys_session_rename",
         "sys_cancel_task",
     } <= names
+
+
+@pytest.mark.parametrize("opted_in", [False, True])
+async def test_advise_models_external_fallback_only_when_opted_in(opted_in: bool) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes._sessions.helpers import _handle_advise_models_mcp
+    from omnigent.server.routing_backend import RoutingBackends
+    from omnigent.server.smart_routing import RoutingResult
+
+    external = SimpleNamespace(route=AsyncMock(return_value=None))
+    local = SimpleNamespace(
+        route=AsyncMock(return_value=RoutingResult(model="model-a", rationale="judge"))
+    )
+    caps = SimpleNamespace(
+        routing_backends=RoutingBackends(external=external, local=local, non_gateway=opted_in)
+    )
+    conv = SimpleNamespace(agent_id=None, host_id="host-test")
+    tasks = {"tasks": [{"task": "work", "agents": [{"agent": "worker", "models": ["model-a"]}]}]}
+    with patch("omnigent.server.routes._sessions.helpers.get_caps", return_value=caps):
+        response = await _handle_advise_models_mcp(1, conv, tasks, None)
+    text = json.loads(response.body)["result"]["content"][0]["text"]
+    result = json.loads(text)["recommendations"][0]
+    assert result["model"] == ("model-a" if opted_in else None)
+    assert local.route.await_count == (1 if opted_in else 0)

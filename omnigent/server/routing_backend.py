@@ -6,8 +6,8 @@ harness whose inference is gateway-backed. The built-in OSS judge
 (:class:`~omnigent.server.smart_routing.LLMRoutingClient`) names models from the
 candidate menu it is handed, so it serves any harness.
 
-Gateway backing therefore selects the SOURCE rather than hiding the surface: an
-off-gateway pane still routes, just with the built-in judge, and the decision
+By default gateway backing selects the SOURCE rather than hiding the surface: an
+off-gateway pane still routes with the built-in judge unless explicitly opted in, and the decision
 records which router answered so the UI can say so.
 
 The same holds when the preferred router FAILS: :func:`route_with_fallback`
@@ -30,7 +30,7 @@ _logger = logging.getLogger(__name__)
 
 #: Which router produced a decision. ``"databricks-aigw"`` is the external
 #: ``task_v1`` service; ``"oss-llm"`` is the built-in judge.
-RouterSource = Literal["databricks-aigw", "oss-llm"]
+RouterSource = Literal["databricks-aigw", "external", "oss-llm"]
 
 
 @dataclass(frozen=True)
@@ -108,7 +108,9 @@ def select_router(
     """
     external = usable_external(backends)
     if (gateway_backed or backends.non_gateway) and external is not None:
-        return RouterChoice(client=external, source="databricks-aigw")
+        return RouterChoice(
+            client=external, source="databricks-aigw" if gateway_backed else "external"
+        )
     if backends.local is not None:
         return RouterChoice(client=backends.local, source="oss-llm")
     return None
@@ -157,14 +159,23 @@ async def route_with_fallback(
     choice = select_router(backends, gateway_backed=gateway_backed)
     if choice is None:
         return None
-    if choice.source != "databricks-aigw" or backends.local is None:
+
+    async def invoke() -> RoutingResult | None:
+        route_for_gateway = getattr(choice.client, "route_for_gateway", None)
+        if route_for_gateway is not None:
+            return await route_for_gateway(
+                message, available_models, gateway_backed=gateway_backed
+            )
+        return await choice.client.route(message, available_models)
+
+    if choice.source == "oss-llm" or backends.local is None:
         return RoutedCall(
-            result=await choice.client.route(message, available_models),
+            result=await invoke(),
             source=choice.source,
             client=choice.client,
         )
     try:
-        result = await choice.client.route(message, available_models)
+        result = await invoke()
     except Exception:  # the judge is the fallback for any failure
         _logger.warning(
             "routing: the external router raised; falling back to the built-in judge",
@@ -172,17 +183,24 @@ async def route_with_fallback(
         )
     else:
         if result is not None:
-            return RoutedCall(result=result, source="databricks-aigw", client=choice.client)
+            return RoutedCall(result=result, source=choice.source, client=choice.client)
         _logger.info(
             "routing: the external router gave no verdict (%s); "
             "falling back to the built-in judge",
             getattr(choice.client, "last_error", None),
         )
-    return RoutedCall(
-        result=await backends.local.route(message, available_models),
-        source="oss-llm",
-        client=backends.local,
-    )
+    if backends.non_gateway:
+        import asyncio
+
+        try:
+            result = await asyncio.wait_for(
+                backends.local.route(message, available_models), timeout=6.5
+            )
+        except TimeoutError:
+            result = None
+    else:
+        result = await backends.local.route(message, available_models)
+    return RoutedCall(result=result, source="oss-llm", client=backends.local)
 
 
 def reported_gateway_inference(
@@ -285,6 +303,7 @@ def routing_sources(caps: Any) -> dict[str, bool]:  # type: ignore[explicit-any]
     return {
         "external": usable_external(backends) is not None,
         "oss": backends.local is not None or _managed_llm_capability(caps),
+        "external_non_gateway": backends.non_gateway and usable_external(backends) is not None,
     }
 
 

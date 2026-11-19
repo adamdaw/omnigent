@@ -15070,6 +15070,11 @@
             "title": "External",
             "type": "boolean"
           },
+          "external_non_gateway": {
+            "default": false,
+            "title": "External Non Gateway",
+            "type": "boolean"
+          },
           "oss": {
             "title": "Oss",
             "type": "boolean"

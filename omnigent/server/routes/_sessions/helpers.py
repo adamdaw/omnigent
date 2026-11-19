@@ -12200,7 +12200,11 @@ async def _handle_advise_models_mcp(
             rpc_id, json.dumps({"error": "tasks must be a list", "router_on": False})
         )
 
-    from omnigent.server.routing_backend import backends_from_caps, route_with_fallback
+    from omnigent.server.routing_backend import (
+        backends_from_caps,
+        gateway_backs_all,
+        route_with_fallback,
+    )
 
     caps = get_caps()
     backends = backends_from_caps(caps)
@@ -12303,10 +12307,18 @@ async def _handle_advise_models_mcp(
             )
             continue
         try:
-            call = await route_with_fallback(
-                backends, task_text, harness_models, gateway_backed=True
-            )
-            verdict = call.result if call else None
+            if backends.non_gateway:
+                call = await route_with_fallback(
+                    backends,
+                    task_text,
+                    harness_models,
+                    gateway_backed=gateway_backs_all(
+                        conv, (_resolve_harness_for_worker(h) or h for h in harness_models)
+                    ),
+                )
+                verdict = call.result if call else None
+            else:
+                verdict = await routing_client.route(task_text, harness_models)
         except Exception:  # noqa: BLE001  # routing failures must not crash the advisor
             _logger.exception("_handle_advise_models_mcp: route failed task=%r", title)
             verdict = None

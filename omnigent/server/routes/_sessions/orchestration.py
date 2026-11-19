@@ -12086,7 +12086,10 @@ def _external_router_usable(caps: Any = None) -> bool:  # type: ignore[explicit-
 
 def _non_gateway_external_available() -> bool:
     """Whether an opted-in external router can serve off-gateway harnesses."""
-    from omnigent.runtime._globals import _caps
+    try:
+        from omnigent.runtime._globals import _caps
+    except ImportError:
+        return False
     from omnigent.server.routing_backend import backends_from_caps, usable_external
 
     backends = backends_from_caps(_caps)

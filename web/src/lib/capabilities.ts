@@ -38,6 +38,7 @@ const SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_re
  * reports neither, so the parser degrades from ``smart_routing_enabled``.
  */
 export interface SmartRoutingSources {
+  external_non_gateway?: boolean;
   external: boolean;
   oss: boolean;
 }
@@ -569,7 +570,13 @@ function parseSmartRoutingSources(raw: unknown, routingEnabled: boolean): SmartR
     return { external: routingEnabled, oss: routingEnabled };
   }
   const sources = raw as Partial<Record<keyof SmartRoutingSources, unknown>>;
-  return { external: sources.external === true, oss: sources.oss === true };
+  return {
+    external: sources.external === true,
+    oss: sources.oss === true,
+    ...(sources.external_non_gateway === true && sources.external === true
+      ? { external_non_gateway: true }
+      : {}),
+  };
 }
 
 function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureValues {
