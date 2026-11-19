@@ -1625,6 +1625,116 @@ async def test_a_fork_takes_the_brain_pin_from_its_own_target_spec(
     assert target_opts_in is pinned
 
 
+async def test_a_fork_onto_a_pinned_agent_drops_an_unresolved_auto_sentinel(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An agent switch within one family keeps model settings, never the sentinel."""
+    source_agent = await create_test_agent(
+        client,
+        name="pinned-brain-fork-auto-source",
+        executor={"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    )
+    source = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": source_agent["id"],
+            "cost_control_mode_override": "on",
+            "harness_override": "auto",
+        },
+    )
+    assert source.status_code == 201, source.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    source_conv = conv_store.get_conversation(str(source.json()["id"]))
+    assert source_conv is not None
+    assert source_conv.harness_override == "auto"
+    pinned_agent = await create_test_agent(
+        client,
+        name="pinned-brain-fork-auto-target",
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk", "smart_routing_harness": "pinned"},
+        },
+    )
+
+    fork = await client.post(
+        f"/v1/sessions/{source_conv.id}/fork", json={"agent_id": pinned_agent["id"]}
+    )
+    assert fork.status_code in (200, 201), fork.text
+    fork_conv = conv_store.get_conversation(str(fork.json()["id"]))
+    assert fork_conv is not None
+    assert fork_conv.labels.get(PINNED_BRAIN_LABEL_KEY) == "1"
+    assert fork_conv.harness_override != "auto"
+    assert AUTO_HARNESS_LABEL_KEY not in fork_conv.labels
+
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=GPT_MODEL, rationale="cheap", harness="codex")
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "carry on"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                fork_conv.id, fork_conv, body, conv_store, runner_client
+            )
+    assert routing_client.calls == []
+    refreshed = conv_store.get_conversation(fork_conv.id)
+    assert refreshed is not None
+    assert refreshed.harness_override != "auto"
+    assert refreshed.model_override is None
+
+
+async def test_the_auto_path_refuses_a_pinned_brain_carrying_a_sentinel(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _agent, parent, conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-stray-sentinel", smart_routing_harness="pinned"
+    )
+    # A legacy or hand-edited row: pinned, yet still on the auto sentinel.
+    conv_store.update_conversation(parent.id, harness_override="auto")
+    stray = conv_store.get_conversation(parent.id)
+    assert stray is not None
+    assert stray.harness_override == "auto"
+
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=GPT_MODEL, rationale="cheap", harness="codex")
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "plan it"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                stray.id, stray, body, conv_store, runner_client
+            )
+    assert routing_client.calls == []
+    refreshed = conv_store.get_conversation(parent.id)
+    assert refreshed is not None
+    assert refreshed.harness_override is None
+    assert refreshed.model_override is None
+
+
+async def test_a_bundle_upload_session_of_a_pinned_spec_is_a_pinned_brain(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(
+        client,
+        name="pinned-brain-bundle-upload",
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk", "smart_routing_harness": "pinned"},
+        },
+    )
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(agent["_session_id"])
+    assert conv is not None
+    assert conv.labels.get(PINNED_BRAIN_LABEL_KEY) == "1"
+
+
 async def test_a_fork_of_a_worker_is_no_longer_authorized(
     client: httpx.AsyncClient,
     db_uri: str,

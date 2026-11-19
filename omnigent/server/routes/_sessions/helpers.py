@@ -2308,6 +2308,56 @@ def _validated_spec_smart_routing_default(spec: AgentSpec) -> bool:
     return True
 
 
+def _spec_brain_routing(agent: Agent, agent_cache: AgentCache | None) -> str | None:
+    """Read the bound spec's ``smart_routing_harness`` value.
+
+    :param agent: The bound agent row.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: ``"auto"``, ``"pinned"``, or ``None`` when the spec sets
+        neither or cannot be loaded.
+    :raises OmnigentError: ``invalid_input`` when the spec's value is invalid.
+    """
+    spec = _routing_spec(agent, agent_cache)
+    return _validated_spec_smart_routing_harness(spec) if spec is not None else None
+
+
+def _routing_spec(agent: Agent, agent_cache: AgentCache | None) -> AgentSpec | None:
+    """Load the bound spec for a create-time Smart Routing opt-in.
+
+    :param agent: The bound agent row.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: The parsed spec, or ``None`` when it cannot be loaded.
+    """
+    if agent_cache is None:
+        return None
+    try:
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+        # An unloadable spec just means "no opt-in"; the create's own
+        # validation reports it.
+        _logger.debug("create-time routing: agent %r failed to load", agent.name, exc_info=True)
+        return None
+    return loaded.spec
+
+
+def _agent_pins_its_brain(agent: Agent, agent_cache: AgentCache | None) -> bool:
+    """Whether a session bound to *agent* is a pinned Smart Routing brain.
+
+    The one reading of ``smart_routing_harness: pinned`` every place that
+    binds a session to an agent uses: creates, forks and side chats, and the
+    session copies automations start from.
+
+    :param agent: The agent the session is bound to.
+    :param agent_cache: The server's cache for loading its spec. ``None``
+        (no cache wired) reads as no pin.
+    :returns: ``True`` when the agent's spec pins its brain.
+    :raises OmnigentError: ``invalid_input`` when the spec's value is invalid.
+    """
+    return _spec_brain_routing(agent, agent_cache) == PINNED_BRAIN_VALUE
+
+
 def _utc_day(epoch_seconds: int) -> str:
     """
     Convert a Unix epoch timestamp to its UTC calendar day.
@@ -13150,6 +13200,7 @@ __all__ = [
     "_agent_forks_opencode_native_session",
     "_agent_is_native",
     "_agent_is_native_impl",
+    "_agent_pins_its_brain",
     "_agent_provider_family",
     "_allow_all_edits_eligible",
     "_allow_remember_eligible",
@@ -13335,6 +13386,7 @@ __all__ = [
     "_resolve_subagent_spec",
     "_resource_event_item_from_sse",
     "_routing_decision_item_from_sse",
+    "_routing_spec",
     "_same_provider_family",
     "_same_provider_family_impl",
     "_seed_missing_title",
@@ -13347,6 +13399,7 @@ __all__ = [
     "_set_read_state",
     "_signal_harness_elicitation_resolved_by_id",
     "_signal_terminal_resolved_harness_elicitation",
+    "_spec_brain_routing",
     "_spec_config_flag_explicitly_disabled",
     "_spec_harness",
     "_start_managed_launch_task",
