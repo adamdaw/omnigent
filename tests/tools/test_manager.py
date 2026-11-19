@@ -1821,3 +1821,50 @@ async def test_advise_models_external_fallback_only_when_opted_in(opted_in: bool
     result = json.loads(text)["recommendations"][0]
     assert result["model"] == ("model-a" if opted_in else None)
     assert local.route.await_count == (1 if opted_in else 0)
+
+
+async def test_advise_models_opt_in_routes_external_on_off_gateway_host() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.host_registry import HostRegistry
+    from omnigent.server.routes._sessions.common import set_server_host_registry
+    from omnigent.server.routes._sessions.helpers import _handle_advise_models_mcp
+    from omnigent.server.routing_backend import RoutingBackends, route_with_fallback
+    from omnigent.server.smart_routing import RoutingResult
+
+    host_id = "aabbccddeeff00112233445566778899"
+    registry = HostRegistry()
+    registry.record_gateway_inference(host_id, {"claude-native": False})
+    external = SimpleNamespace(
+        route=AsyncMock(return_value=RoutingResult(model="model-a", rationale="external"))
+    )
+    local = SimpleNamespace(route=AsyncMock(return_value=None))
+    caps = SimpleNamespace(
+        routing_backends=RoutingBackends(external=external, local=local, non_gateway=True)
+    )
+    conv = SimpleNamespace(agent_id=None, host_id=host_id)
+    tasks = {
+        "tasks": [{"task": "work", "agents": [{"agent": "claude-native", "models": ["model-a"]}]}]
+    }
+    calls: list[Any] = []
+
+    async def record(*args: Any, **kwargs: Any) -> Any:
+        assert kwargs["gateway_backed"] is False
+        call = await route_with_fallback(*args, **kwargs)
+        calls.append(call)
+        return call
+
+    set_server_host_registry(registry)
+    try:
+        with (
+            patch("omnigent.server.routes._sessions.helpers.get_caps", return_value=caps),
+            patch("omnigent.server.routing_backend.route_with_fallback", side_effect=record),
+        ):
+            response = await _handle_advise_models_mcp(1, conv, tasks, None)
+    finally:
+        set_server_host_registry(None)
+    assert calls[0].source == "external"
+    assert local.route.await_count == 0
+    text = json.loads(response.body)["result"]["content"][0]["text"]
+    assert json.loads(text)["recommendations"][0]["model"] == "model-a"

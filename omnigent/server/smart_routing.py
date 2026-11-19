@@ -2325,7 +2325,7 @@ async def route_session_harness(
     if result is None:
         # Surface the client's specific failure reason (e.g. HTTP 401 with the
         # gateway's message) when it exposes one; otherwise a generic note.
-        detail = routing_last_error(call.client)
+        detail = call.reason or routing_last_error(call.client)
         reason = (
             f"Routing unavailable: {detail}"
             if detail

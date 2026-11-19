@@ -424,3 +424,23 @@ async def test_non_gateway_external_failure_falls_back(error: Exception | None) 
     )
     assert call is not None and (call.result, call.source) == (_VERDICT, "oss-llm")
     assert external.calls == local.calls == 1
+
+
+async def test_timed_out_judge_reports_per_call_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    from omnigent.server import routing_backend
+
+    class SlowJudge:
+        async def route(self, message: str, available_models: dict[str, list[str]]) -> None:
+            await asyncio.sleep(1)
+
+    monkeypatch.setattr(routing_backend, "NON_GATEWAY_JUDGE_TIMEOUT_S", 0.01)
+    call = await route_with_fallback(
+        RoutingBackends(external=_Recording(None), local=SlowJudge(), non_gateway=True),
+        "hi",
+        _MENU,
+        gateway_backed=False,
+    )
+    assert call is not None and call.result is None
+    assert call.reason == "judge timed out"

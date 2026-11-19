@@ -3860,3 +3860,30 @@ def test_off_gateway_external_selection_keeps_offered_spelling() -> None:
         gateway_backed=False,
     )
     assert selection is not None and selection.model == "glm-5-2"
+
+
+@pytest.mark.asyncio
+async def test_session_reports_judge_timeout_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    from omnigent.server import routing_backend
+
+    class SlowJudge:
+        async def route(self, message: str, available_models: dict[str, list[str]]) -> None:
+            await asyncio.sleep(1)
+
+    external = FakeRoutingClient(None)
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=SlowJudge(), non_gateway=True),
+    )
+    monkeypatch.setattr(routing_backend, "NON_GATEWAY_JUDGE_TIMEOUT_S", 0.01)
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        _harness, _model, _verdict, error = await route_session_harness(
+            "hello",
+            harness_candidates=("claude-native",),
+            catalog={"claude-native": ["claude-sonnet-4-6"]},
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert error == "Routing unavailable: judge timed out"

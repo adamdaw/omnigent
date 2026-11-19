@@ -817,9 +817,10 @@ async def _decide(
     else:
         if call is not None:
             result, client, source = call.result, call.client, call.source
+            raised = call.reason
     if result is None or not getattr(result, "model", None):
         detail = (
-            _opt_str(getattr(client, "last_error", None)) or raised or "router returned no verdict"
+            raised or _opt_str(getattr(client, "last_error", None)) or "router returned no verdict"
         )
         return _unavailable_decision(detail)
 

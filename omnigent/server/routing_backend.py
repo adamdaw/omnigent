@@ -28,6 +28,10 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+# Catalog prep ~3s + external 3s + judge 6.5s = 12.5s, below the
+# runner's SERVER_HOP_TIMEOUT_S of 13s.
+NON_GATEWAY_JUDGE_TIMEOUT_S = 6.5
+
 #: Which router produced a decision. ``"databricks-aigw"`` is the external
 #: ``task_v1`` service; ``"oss-llm"`` is the built-in judge.
 RouterSource = Literal["databricks-aigw", "external", "oss-llm"]
@@ -124,11 +128,13 @@ class RoutedCall:
     :param source: Which router answered (or was asked last).
     :param client: The client asked last, so the caller can read its
         ``last_error`` for the reason behind a ``None`` *result*.
+    :param reason: Per-call failure reason, when the backend supplies one.
     """
 
     result: RoutingResult | None
     source: RouterSource
     client: RoutingClient
+    reason: str | None = None
 
 
 async def route_with_fallback(
@@ -194,10 +200,13 @@ async def route_with_fallback(
 
         try:
             result = await asyncio.wait_for(
-                backends.local.route(message, available_models), timeout=6.5
+                backends.local.route(message, available_models),
+                timeout=NON_GATEWAY_JUDGE_TIMEOUT_S,
             )
         except TimeoutError:
-            result = None
+            return RoutedCall(
+                result=None, source="oss-llm", client=backends.local, reason="judge timed out"
+            )
     else:
         result = await backends.local.route(message, available_models)
     return RoutedCall(result=result, source="oss-llm", client=backends.local)
