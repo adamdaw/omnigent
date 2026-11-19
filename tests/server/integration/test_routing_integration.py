@@ -1454,6 +1454,87 @@ async def test_a_client_cannot_seed_the_pinned_brain_label(client: httpx.AsyncCl
     assert resp.status_code == 400, resp.text
 
 
+# ── 7e. A spec can start its sessions with Smart Routing on ────────
+
+
+@pytest.mark.parametrize(
+    ("create_overrides", "cost_control", "subagent_routing"),
+    [
+        # Nothing asked for: the spec's default turns routing on.
+        ({}, "on", "on"),
+        # An explicit off for either switch wins over the spec.
+        ({"cost_control_mode_override": "off"}, "off", None),
+        ({"subagent_routing_override": "off"}, None, "off"),
+    ],
+    ids=["default", "explicit-off", "explicit-subagent-off"],
+)
+async def test_a_spec_default_starts_its_sessions_with_routing_on(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    create_overrides: dict[str, Any],
+    cost_control: str | None,
+    subagent_routing: str | None,
+) -> None:
+    case = "-".join(create_overrides) or "default"
+    agent = await create_test_agent(
+        client,
+        name=f"routing-default-{case}",
+        executor={
+            "type": "omnigent",
+            "config": {
+                "harness": "claude-sdk",
+                "smart_routing_harness": "pinned",
+                "smart_routing_default": "on",
+            },
+        },
+    )
+    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"], **create_overrides})
+    assert resp.status_code == 201, resp.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(str(resp.json()["id"]))
+    assert conv is not None
+    assert conv.cost_control_mode_override == cost_control
+    assert conv.subagent_routing_override == subagent_routing
+    # The brain stays pinned either way.
+    assert conv.harness_override is None
+    assert conv.labels.get(PINNED_BRAIN_LABEL_KEY) == "1"
+
+
+async def test_a_spec_default_does_not_reach_a_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(
+        client,
+        name="routing-default-child",
+        executor={"type": "omnigent", "config": {"smart_routing_default": "on"}},
+    )
+    parent = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "subagent_routing_override": "off"},
+    )
+    assert parent.status_code == 201, parent.text
+    child = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "parent_session_id": parent.json()["id"]},
+    )
+    assert child.status_code == 201, child.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(str(child.json()["id"]))
+    assert conv is not None
+    assert conv.cost_control_mode_override is None
+    assert conv.subagent_routing_override is None
+
+
+async def test_an_invalid_spec_routing_default_is_rejected(client: httpx.AsyncClient) -> None:
+    agent = await create_test_agent(
+        client,
+        name="routing-default-invalid",
+        executor={"type": "omnigent", "config": {"smart_routing_default": "always"}},
+    )
+    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert resp.status_code == 400, resp.text
+    assert "smart_routing_default" in resp.text
+
+
 # ── 8. Truthful record on a claude-native turn ─────────────────────
 
 
