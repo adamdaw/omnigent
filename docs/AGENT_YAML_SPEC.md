@@ -99,6 +99,36 @@ launch. The older `llm.reasoning_effort` is still accepted as a back-compat alia
 (lifted to `executor.reasoning_effort` at parse time); when both are set,
 `executor.reasoning_effort` takes precedence.
 
+### Smart Routing for orchestrators
+
+A spec that pins `executor.config.harness` also confines Smart Routing to that
+harness's model family: the brain's own model is routed, and its sub-agents are
+routed within the brain's family only. An orchestrator whose workers run in other
+families (pi, codex) chooses one of two opt-ins with
+`executor.config.smart_routing_harness` (`executor.type: omnigent` only):
+
+```yaml
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+    smart_routing_harness: pinned   # or: auto
+```
+
+- `auto` hands the brain harness to the router when Smart Routing is on, so the
+  brain may move to another family and its sub-agents may too.
+- `pinned` keeps the brain on its declared harness and model. Only its sub-agent
+  dispatches are routed, each on its own harness, and a worker the bundle
+  declares (`tools.agents`), dispatched on its declared harness, may run in
+  another family. Any other spawn keeps the family rule, and a create asking
+  for `harness_override: auto` is refused.
+
+`executor.config.smart_routing_default: on` starts every new top-level session of
+the agent with Smart Routing on, whether it is created from the web UI, the CLI
+or the API. A create that sends `cost_control_mode_override: off` or
+`subagent_routing_override: off` keeps routing off. With `pinned`, the brain
+stays pinned and only its sub-agents are routed.
+
 The `cursor` harness (Cursor's `cursor-agent`) is the exception: it talks
 only to Cursor's own backend and has no custom API base-URL, so the Databricks
 gateway / `auth.type: databricks` does not apply. Authenticate it with

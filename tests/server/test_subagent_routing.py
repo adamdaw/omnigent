@@ -18,6 +18,8 @@ from omnigent.inner.hook_scripts.subagent_router import read_router_endpoint
 from omnigent.runner.subagent_routing import (
     ADVERTISEMENT_FILE,
     AUTO_HARNESS_LABEL_KEY,
+    PINNED_BRAIN_LABEL_KEY,
+    PINNED_BRAIN_WORKER_LABEL_KEY,
     PLAIN_SESSION,
     ROUTING_DECISION_LABEL_KEY,
     SessionRoutingClass,
@@ -26,6 +28,7 @@ from omnigent.runner.subagent_routing import (
     auto_harness_session,
     candidate_models,
     decision_record,
+    declared_worker_of_pinned_brain,
     ensure_session_router,
     ensure_session_router_quietly,
     forget_session_routing_class,
@@ -210,9 +213,15 @@ def test_candidate_models_offers_both_families_for_auto_sessions() -> None:
 class _Conv:
     """Minimal conversation row for the auto-harness gate."""
 
-    def __init__(self, labels: dict[str, str] | None = None, harness_override: str | None = None):
+    def __init__(
+        self,
+        labels: dict[str, str] | None = None,
+        harness_override: str | None = None,
+        id: str = "conv_row",
+    ):
         self.labels = labels or {}
         self.harness_override = harness_override
+        self.id = id
 
 
 @pytest.mark.parametrize(
@@ -259,6 +268,33 @@ def test_auto_harness_session_is_the_only_cross_harness_enabler(
     family — so a pinned session can never receive a redirect verdict.
     """
     assert auto_harness_session(conv, parent) is expected
+
+
+_PINNED_BRAIN = _Conv(labels={PINNED_BRAIN_LABEL_KEY: "1"}, id="conv_brain")
+_WORKER = _Conv(labels={PINNED_BRAIN_WORKER_LABEL_KEY: "conv_brain"})
+
+
+@pytest.mark.parametrize(
+    ("conv", "parent", "expected"),
+    [
+        (_WORKER, _PINNED_BRAIN, True),
+        # A child the create never authorized keeps the family rule.
+        (_Conv(), _PINNED_BRAIN, False),
+        # An authorization names one parent; it does not carry to another.
+        (_WORKER, _Conv(labels={PINNED_BRAIN_LABEL_KEY: "1"}, id="conv_other"), False),
+        # A parent that no longer pins its brain authorizes nothing.
+        (_WORKER, _Conv(harness_override="claude-sdk", id="conv_brain"), False),
+        (_WORKER, None, False),
+        (None, _PINNED_BRAIN, False),
+    ],
+    ids=["authorized", "unauthorized", "other-parent", "no-opt-in", "no-parent", "no-row"],
+)
+def test_only_a_pinned_brains_authorized_worker_may_leave_its_family(
+    conv: _Conv | None,
+    parent: _Conv | None,
+    expected: bool,
+) -> None:
+    assert declared_worker_of_pinned_brain(conv, parent) is expected
 
 
 @pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
@@ -1197,6 +1233,13 @@ def test_subagent_routing_enabled_is_two_state(override: str | None, expected: b
             "auto",
             {AUTO_HARNESS_LABEL_KEY: "1"},
             SessionRoutingClass(routing_enabled=True, auto_harness=True, turn_routing=True),
+        ),
+        # A pinned brain routes its spawns but never its own first message.
+        (
+            "on",
+            "claude-native",
+            {PINNED_BRAIN_LABEL_KEY: "1"},
+            SessionRoutingClass(routing_enabled=True),
         ),
     ],
 )

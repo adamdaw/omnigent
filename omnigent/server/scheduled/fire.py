@@ -100,6 +100,7 @@ from omnigent.server.routes._session_create_validation import (
 )
 from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import (
+    _agent_pins_its_brain,
     _announce_session_added,
     _session_status_from_cache,
 )
@@ -1840,6 +1841,13 @@ async def _create_session_resources(
                 git_branch=worktree.branch if worktree else None,
             )
         else:
+            run_agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+            if run_agent is not None and await asyncio.to_thread(
+                _agent_pins_its_brain, run_agent, deps.agent_cache
+            ):
+                from omnigent.runner.subagent_routing import PINNED_BRAIN_LABEL_KEY
+
+                labels = {**labels, PINNED_BRAIN_LABEL_KEY: "1"}
             conv = await asyncio.to_thread(
                 deps.conversation_store.create_conversation,
                 agent_id=task.agent_id,
@@ -1974,6 +1982,7 @@ async def _copy_source_session_for_run(
             source_id=task.source_session_id,
             title=_scheduled_session_title(task),
             agent_id=task.agent_id,
+            pins_brain=await asyncio.to_thread(_agent_pins_its_brain, agent, deps.agent_cache),
             created_by=task.user_id or RESERVED_USER_LOCAL,
             project_id=project_id,
             carry_history_into_native=carry,

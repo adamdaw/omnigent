@@ -109,6 +109,24 @@ async def test_routes_pins_and_records_one_chip() -> None:
     assert rec.routed == [("codex-native", "What testing framework does this project use?")]
 
 
+async def test_a_pinned_brain_is_never_turn_routed() -> None:
+    from omnigent.runner.subagent_routing import PINNED_BRAIN_LABEL_KEY
+
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_1",
+        _request(),
+        conv=_FakeConv(labels={PINNED_BRAIN_LABEL_KEY: "1"}),
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "allow"
+    assert decision.terminal is True
+    assert rec.routed == []
+    assert rec.pinned == []
+
+
 async def test_an_earlier_routing_decision_is_the_authoritative_no_op() -> None:
     """Server state — not the hook's local marker — is what stops re-routing."""
     rec = _Recorder()

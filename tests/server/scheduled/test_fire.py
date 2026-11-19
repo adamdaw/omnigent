@@ -4436,6 +4436,83 @@ async def test_a_run_on_another_agent_leaves_the_copys_provider_binding(
     assert fork["copy_inference_snapshot"] is keeps_binding
 
 
+class _PinnedBrainAgentCache(FakeAgentCache):
+    """Serves ``smart_routing_harness: pinned`` for the given agent ids."""
+
+    def __init__(self, pinned_agent_ids: set[str]) -> None:
+        super().__init__()
+        self._pinned_agent_ids = pinned_agent_ids
+
+    def load(self, agent_id: str, bundle_location: str, **_: Any) -> _FakeLoadedAgent:
+        loaded = super().load(agent_id, bundle_location)
+        if agent_id in self._pinned_agent_ids:
+            loaded.spec.executor.type = "omnigent"
+            loaded.spec.executor.config["smart_routing_harness"] = "pinned"
+        return loaded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_id", "pinned"),
+    [("ag_1", True), ("ag_2", False)],
+    ids=["same-agent", "changed-agent"],
+)
+async def test_a_run_takes_the_brain_pin_from_its_own_agent(agent_id: str, pinned: bool) -> None:
+    """The copy runs ag_1, which pins its brain; ag_2 does not.
+
+    The store never copies the pin (see the store tests), so the run carries it
+    only when its own agent's spec opts in.
+    """
+    from omnigent.runner.subagent_routing import PINNED_BRAIN_LABEL_KEY
+
+    conv_store = FakeConversationStore()
+    agents = FakeAgentStore({"ag_1": _FakeAgent("ag_1"), "ag_2": _FakeAgent("ag_2")})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(source_session_id="conv_source", agent_id=agent_id)}
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=agents,
+        agent_cache=_PinnedBrainAgentCache({"ag_1"}),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (fork,) = conv_store.forked
+    assert fork["agent_id"] == agent_id
+    assert ((fork.get("extra_labels") or {}).get(PINNED_BRAIN_LABEL_KEY) == "1") is pinned
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("agent_id", "pinned"), [("ag_1", True), ("ag_2", False)])
+async def test_a_fresh_run_takes_the_brain_pin_from_its_agent(agent_id: str, pinned: bool) -> None:
+    from omnigent.runner.subagent_routing import PINNED_BRAIN_LABEL_KEY
+
+    conv_store = FakeConversationStore()
+    agents = FakeAgentStore({"ag_1": _FakeAgent("ag_1"), "ag_2": _FakeAgent("ag_2")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(agent_id=agent_id)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=agents,
+        agent_cache=_PinnedBrainAgentCache({"ag_1"}),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (created,) = conv_store.created
+    assert ((created.get("labels") or {}).get(PINNED_BRAIN_LABEL_KEY) == "1") is pinned
+
+
 @pytest.mark.asyncio
 async def test_a_run_copy_that_cannot_bind_its_host_is_deleted() -> None:
     conv_store = FakeConversationStore()
