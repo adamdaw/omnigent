@@ -2227,30 +2227,37 @@ def _validated_harness_override_executor_type(agent: Agent) -> None:
         )
 
 
-#: ``executor.config`` key by which a spec hands its brain harness to Smart
-#: Routing. ``auto`` is the only accepted value.
+#: ``executor.config`` key by which a spec says what Smart Routing does with its
+#: brain harness: ``auto`` hands it to the router, ``pinned`` keeps it.
 SMART_ROUTING_HARNESS_CONFIG_KEY = "smart_routing_harness"
 
 #: The ``harness_override`` sentinel meaning "the router picks the harness".
 AUTO_HARNESS_SENTINEL = "auto"
 
+#: ``smart_routing_harness`` value keeping the brain on its declared harness and
+#: model while its declared workers are routed, across families if need be.
+PINNED_BRAIN_VALUE = "pinned"
+
 
 def _validated_spec_smart_routing_harness(spec: AgentSpec) -> str | None:
     """
-    Read a spec's opt-in for routing its own brain harness.
+    Read a spec's Smart Routing choice for its own brain harness.
 
     A spec that pins ``executor.config.harness`` also pins the family every
     sub-agent is routed within, so a cross-family sub-agent cannot stay on its
     declared harness. ``smart_routing_harness: auto`` lets such a spec keep its
     pin for a normal session and hand the harness to the router when Smart
-    Routing is on.
+    Routing is on. ``smart_routing_harness: pinned`` keeps the brain's harness
+    and model instead, and routes only its declared workers, which may then
+    run in another family.
 
     Validated on the same rules as :func:`_validated_harness_override`: the
-    value must be the ``"auto"`` sentinel, and only an ``executor.type:
-    omnigent`` spec has a swappable brain harness to give away.
+    value must be ``"auto"`` or ``"pinned"``, and only an ``executor.type:
+    omnigent`` spec has a brain harness to route around.
 
     :param spec: The bound agent's parsed spec.
-    :returns: ``"auto"`` when the spec opts in, else ``None``.
+    :returns: ``"auto"`` or ``"pinned"`` when the spec sets the key, else
+        ``None``.
     :raises OmnigentError: ``invalid_input`` for any other value, or for the
         key on a non-omnigent executor type.
     """
@@ -2260,9 +2267,10 @@ def _validated_spec_smart_routing_harness(spec: AgentSpec) -> str | None:
     if value is None:
         return None
     key = f"executor.config.{SMART_ROUTING_HARNESS_CONFIG_KEY}"
-    if value != AUTO_HARNESS_SENTINEL:
+    if value not in (AUTO_HARNESS_SENTINEL, PINNED_BRAIN_VALUE):
         raise OmnigentError(
-            f"invalid {key}: must be {AUTO_HARNESS_SENTINEL!r}, got {value!r}",
+            f"invalid {key}: must be {AUTO_HARNESS_SENTINEL!r} or "
+            f"{PINNED_BRAIN_VALUE!r}, got {value!r}",
             code=ErrorCode.INVALID_INPUT,
         )
     if spec.executor.type != OMNIGENT_EXECUTOR_TYPE:
@@ -2271,7 +2279,7 @@ def _validated_spec_smart_routing_harness(spec: AgentSpec) -> str | None:
             f"agents; this spec declares executor.type {spec.executor.type!r}",
             code=ErrorCode.INVALID_INPUT,
         )
-    return AUTO_HARNESS_SENTINEL
+    return AUTO_HARNESS_SENTINEL if value == AUTO_HARNESS_SENTINEL else PINNED_BRAIN_VALUE
 
 
 def _utc_day(epoch_seconds: int) -> str:
@@ -11472,6 +11480,14 @@ def _reject_server_reserved_label_seed(
         raise OmnigentError(
             f"label {reserved[0]!r} is set only when a session is created"
             " and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    from omnigent.runner.subagent_routing import PINNED_BRAIN_LABEL_KEY
+
+    # Forging it would let a session's children escape its model family.
+    if PINNED_BRAIN_LABEL_KEY in labels:
+        raise OmnigentError(
+            f"label {PINNED_BRAIN_LABEL_KEY!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
     # The archive timestamp is stamped by the server on the archive transition
