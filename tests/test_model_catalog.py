@@ -1998,6 +1998,53 @@ def test_native_only_binding_does_not_feed_the_sdk_worker(
     assert [model["id"] for model in row["models"]] == _CLI_LOGIN_CODEX_IDS
 
 
+@pytest.mark.parametrize(
+    ("allowlist", "expected"),
+    [
+        (None, _CLI_LOGIN_CODEX_IDS),
+        (["gpt-6-astra", "gpt-not-in-probe"], ["gpt-6-astra"]),
+    ],
+    ids=["no-allowlist", "allowlist"],
+)
+def test_subscription_binding_lists_the_native_probe_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    allowlist: list[str] | None,
+    expected: list[str],
+) -> None:
+    """A native worker bound to its CLI subscription lists the probe, then the allowlist."""
+    binding = "inference:\n  harnesses:\n    codex-native:\n      provider: codex\n"
+    if allowlist is not None:
+        binding += "      model_allowlist: [" + ", ".join(allowlist) + "]\n"
+    _isolate_config(monkeypatch, tmp_path, _CODEX_SUBSCRIPTION_CONFIG + binding)
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    _seed_cli_login_catalogs(codex_pinned=True)
+
+    spec = _worker_spec("codex-native")
+    assert resolve_model_provider(spec, "codex-native").kind == "subscription"
+    row = catalog_for_spec(spec)["self"]
+    assert [model["id"] for model in row["models"]] == expected
+
+
+def test_gateway_binding_keeps_its_own_native_listing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A native worker bound to a gateway never borrows the CLI-login probe catalog."""
+    monkeypatch.setenv("OMNIGENT_TEST_GW_KEY", "sk-test")
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        _CODEX_SUBSCRIPTION_CONFIG
+        + _GATEWAY_PROVIDER_CONFIG
+        + "inference:\n  harnesses:\n    codex-native:\n      provider: gw\n",
+    )
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    _seed_cli_login_catalogs(codex_pinned=True)
+
+    row = catalog_for_spec(_worker_spec("codex-native"))["self"]
+    assert not {model["id"] for model in row["models"]} & set(_CLI_LOGIN_CODEX_IDS)
+
+
 def test_unconfigured_rows_require_a_cli_login_launch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
