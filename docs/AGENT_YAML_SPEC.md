@@ -119,8 +119,9 @@ executor:
   brain may move to another family and its sub-agents may too.
 - `pinned` keeps the brain on its declared harness and model. Only its sub-agent
   dispatches are routed, each on its own harness, and a worker the bundle
-  declares (`tools.agents`) may run in another family. Any other spawn keeps the
-  family rule.
+  declares (`tools.agents`), dispatched on its declared harness, may run in
+  another family. Any other spawn keeps the family rule, and a create asking
+  for `harness_override: auto` is refused.
 
 `executor.config.smart_routing_default: on` starts every new top-level session of
 the agent with Smart Routing on, whether it is created from the web UI, the CLI
