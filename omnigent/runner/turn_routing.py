@@ -90,7 +90,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from omnigent.runner.subagent_routing import routing_enabled, write_advertisement
+from omnigent.runner.subagent_routing import (
+    pinned_brain_session,
+    routing_enabled,
+    write_advertisement,
+)
 
 if TYPE_CHECKING:
     import httpx
@@ -612,6 +616,8 @@ async def resolve_turn_route(
 
     if conv is None:
         return _allow("session not found")
+    if parent is None and pinned_brain_session(conv):
+        return _allow("a pinned brain keeps its own model", terminal=True)
     if already_routed(conv):
         return _allow("this session already has a routing decision", terminal=True)
     if not routing_enabled(

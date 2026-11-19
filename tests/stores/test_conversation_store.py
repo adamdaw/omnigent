@@ -6525,6 +6525,68 @@ def test_fork_conversation_drops_instance_scoped_labels(
     assert fork.session_todos == []
 
 
+def test_no_copy_carries_the_smart_routing_pins(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """Every session copy drops the pins; only the caller's re-derived stamp lands.
+
+    The pinned-brain label is re-derived from the copy's own agent spec and
+    passed as ``extra_labels``; a copy stamped that way never keeps the auto
+    sentinel or marker that would hand the brain to the router.
+    """
+    agent_store.create(
+        agent_id="5e7d1c2b3a4f5e6d7c8b9a0f1e2d3c4b",
+        name="fork-routing-pins",
+        bundle_location="5e7d1c2b3a4f5e6d7c8b9a0f1e2d3c4b/fakehash",
+    )
+    source = conversation_store.create_conversation(agent_id="5e7d1c2b3a4f5e6d7c8b9a0f1e2d3c4b")
+    conversation_store.update_conversation(source.id, harness_override="auto")
+    conversation_store.set_labels(
+        source.id,
+        {
+            "omnigent.routing.pinned_brain": "1",
+            "omnigent.routing.pinned_brain_worker": "conv_parent",
+            "omnigent.routing.auto_harness": "1",
+        },
+    )
+
+    plain = conversation_store.fork_conversation(source.id)
+    assert "omnigent.routing.pinned_brain" not in plain.labels
+    assert "omnigent.routing.pinned_brain_worker" not in plain.labels
+    # An unpinned copy is an ordinary auto session, as before.
+    assert plain.labels.get("omnigent.routing.auto_harness") == "1"
+    assert plain.harness_override == "auto"
+
+    pinned = conversation_store.fork_conversation(
+        source.id, extra_labels={"omnigent.routing.pinned_brain": "1"}
+    )
+    assert pinned.labels.get("omnigent.routing.pinned_brain") == "1"
+    assert "omnigent.routing.pinned_brain_worker" not in pinned.labels
+    assert "omnigent.routing.auto_harness" not in pinned.labels
+    assert pinned.harness_override is None
+
+
+def test_never_copied_routing_label_keys_match_the_routing_constants() -> None:
+    from omnigent.runner.subagent_routing import (
+        AUTO_HARNESS_LABEL_KEY,
+        PINNED_BRAIN_LABEL_KEY,
+        PINNED_BRAIN_WORKER_LABEL_KEY,
+    )
+    from omnigent.stores.conversation_store import (
+        _AUTO_HARNESS_LABEL_KEY,
+        _NEVER_COPIED_ROUTING_LABEL_KEYS,
+        _PINNED_BRAIN_LABEL_KEY,
+    )
+
+    assert {
+        PINNED_BRAIN_LABEL_KEY,
+        PINNED_BRAIN_WORKER_LABEL_KEY,
+    } == _NEVER_COPIED_ROUTING_LABEL_KEYS
+    assert _PINNED_BRAIN_LABEL_KEY == PINNED_BRAIN_LABEL_KEY
+    assert _AUTO_HARNESS_LABEL_KEY == AUTO_HARNESS_LABEL_KEY
+
+
 def test_fork_extra_labels_rearm_bypass_over_the_always_drop(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,

@@ -378,6 +378,7 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_subagent_spec,
     _resource_event_item_from_sse,
     _routing_decision_item_from_sse,
+    _routing_spec,
     _runner_supports_side_chat_settings,
     _RunnerForwardResult,
     _seed_missing_title_from_user_message,
@@ -385,6 +386,7 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_with_child_rollup,
     _SessionEventDispatchResult,
     _signal_terminal_resolved_harness_elicitation,
+    _spec_brain_routing,
     _spec_harness,
     _stable_id_reuse_is_exact_retry,
     _stop_session_via_runner,
@@ -8399,7 +8401,26 @@ async def _forward_event_to_runner(
     _auto_route_failed = False
     # The resolved harness, read back at card-emission time below.
     _auto_harness: str | None = None
-    if conv.harness_override == "auto" and body.type == "message":
+    if conv.harness_override == "auto" and pinned_brain_session(conv):
+        # A pinned brain is never handed to the router. A stray sentinel (a
+        # legacy or copied row) is cleared so the brain runs its own harness.
+        _logger.warning(
+            "auto-harness: cleared the sentinel on pinned brain session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        _unpinned = await asyncio.to_thread(
+            conversation_store.update_conversation,
+            session_id,
+            _unset_harness_override=True,
+        )
+        if _unpinned is not None:
+            conv = _unpinned
+    if (
+        conv.harness_override == "auto"
+        and body.type == "message"
+        and not pinned_brain_session(conv)
+    ):
         from omnigent.server.smart_routing import (
             _AUTO_ROUTING_HARNESSES,
             route_session_harness,
@@ -12494,40 +12515,6 @@ def _spec_routes_its_own_harness(
     return _spec_brain_routing(agent, agent_cache) == AUTO_HARNESS_SENTINEL
 
 
-def _spec_brain_routing(agent: Agent, agent_cache: AgentCache | None) -> str | None:
-    """Read the bound spec's ``smart_routing_harness`` value.
-
-    :param agent: The bound agent row.
-    :param agent_cache: Cache for loading the agent's parsed spec.
-    :returns: ``"auto"``, ``"pinned"``, or ``None`` when the spec sets
-        neither or cannot be loaded.
-    :raises OmnigentError: ``invalid_input`` when the spec's value is invalid.
-    """
-    spec = _routing_spec(agent, agent_cache)
-    return _validated_spec_smart_routing_harness(spec) if spec is not None else None
-
-
-def _routing_spec(agent: Agent, agent_cache: AgentCache | None) -> AgentSpec | None:
-    """Load the bound spec for a create-time Smart Routing opt-in.
-
-    :param agent: The bound agent row.
-    :param agent_cache: Cache for loading the agent's parsed spec.
-    :returns: The parsed spec, or ``None`` when it cannot be loaded.
-    """
-    if agent_cache is None:
-        return None
-    try:
-        loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.operator_authored
-        )
-    except (KeyError, AttributeError, ValueError, ImportError, OSError):
-        # An unloadable spec just means "no opt-in"; the create's own
-        # validation reports it.
-        _logger.debug("create-time routing: agent %r failed to load", agent.name, exc_info=True)
-        return None
-    return loaded.spec
-
-
 def _spec_starts_routing_on(
     body: SessionCreateInput,
     agent: Agent,
@@ -14088,6 +14075,16 @@ def _create_session_from_bundle(
         )
         metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
 
+    # An uploaded bundle's top-level session is a pinned brain, as on any other
+    # create. An invalid value is left to the routing create that reports it.
+    try:
+        _bundle_pins_brain = _validated_spec_smart_routing_harness(spec) == PINNED_BRAIN_VALUE
+    except OmnigentError:
+        _bundle_pins_brain = False
+    if metadata.parent_session_id is None and _bundle_pins_brain:
+        metadata = metadata.model_copy(
+            update={"labels": {**(metadata.labels or {}), PINNED_BRAIN_LABEL_KEY: "1"}}
+        )
     if metadata.parent_session_id is not None:
         try:
             terminal_launch_args = _derive_terminal_launch_args_from_spec(spec)
