@@ -37,7 +37,6 @@ from omnigent.harness_accounts import HarnessAccounts, normalize_harness_account
 from omnigent.harness_availability import (
     HARNESS_CLI_UNRESPONSIVE,
     HARNESS_TMUX_UNAVAILABLE,
-    HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
     is_harness_availability,
 )
@@ -1745,7 +1744,7 @@ HostFrame = (
 
 
 # Older servers reject a readiness frame holding a state they don't know, so an
-# unresponsive CLI travels as "version-too-low" plus this list for newer servers.
+# unresponsive CLI travels as ``True`` (it is advisory) plus this list for newer servers.
 _CLI_UNRESPONSIVE_HARNESSES_KEY = "cli_unresponsive_harnesses"
 
 
@@ -1769,7 +1768,7 @@ def _encode_configured_harnesses(
         return {"configured_harnesses": configured_harnesses}
     return {
         "configured_harnesses": {
-            harness: HARNESS_VERSION_TOO_LOW if harness in unresponsive else availability
+            harness: True if harness in unresponsive else availability
             for harness, availability in configured_harnesses.items()
         },
         _CLI_UNRESPONSIVE_HARNESSES_KEY: unresponsive,

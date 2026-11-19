@@ -1283,7 +1283,26 @@ def test_unresponsive_cli_readiness_stays_decodable_by_older_servers(
     )
     legacy = decode_host_frame(json.dumps(legacy_payload))
     assert isinstance(legacy, type(frame))
-    assert legacy.configured_harnesses == {"pi": "version-too-low", "codex": "binary-missing"}
+    assert legacy.configured_harnesses == {"pi": True, "codex": "binary-missing"}
+    # 0.21.0's harness_launch_availability, which knows no advisory CLI state:
+    # anything but True or needs-auth blocks the launch.
+    assert _v0_21_0_launch_availability("pi", legacy.configured_harnesses) == (True, None)
+    assert _v0_21_0_launch_availability("codex", legacy.configured_harnesses) == (
+        False,
+        "binary-missing",
+    )
+
+
+def _v0_21_0_launch_availability(
+    harness: str, readiness: dict[str, HarnessAvailability] | None
+) -> tuple[bool | None, str | None]:
+    """Replay omnigent 0.21.0's ``harness_launch_availability`` for a canonical harness name."""
+    value = (readiness or {}).get(harness)
+    if value is True:
+        return True, None
+    if value is False or value is None:
+        return False, "unconfigured"
+    return (None if value == "needs-auth" else False), value
 
 
 @pytest.mark.parametrize("frame_kind", sorted(_READINESS_FRAME_FACTORIES))
