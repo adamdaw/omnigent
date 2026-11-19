@@ -14172,6 +14172,14 @@ def _create_session_from_bundle(
         if terminal_launch_args is not None:
             metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
 
+    # A pinned brain's child is created inside the session's accounts. Checked on
+    # the harness and model the child is written with, after every substitution
+    # above, so the bundle path holds the same boundary as the existing-agent one.
+    if metadata.parent_session_id is not None:
+        parent = conversation_store.get_conversation(metadata.parent_session_id)
+        if pinned_brain_session(parent) and (harness := _spec_harness(spec)) != "auto":
+            _assert_inside_account_boundary(harness, inference_model)
+
     if agent_store is not None and metadata.parent_session_id is None:
         agent = uploaded_agent_for(
             agent_store,

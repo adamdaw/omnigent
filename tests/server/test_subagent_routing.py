@@ -439,8 +439,41 @@ async def test_a_pinned_brains_spawn_is_refused_when_the_judge_is_not_local() ->
     finally:
         forget_session_routing_class(session_id)
     assert client.calls == []
-    assert decision.action == "allow"
+    assert decision.action == "deny"
+    assert decision.model is None
     assert "built-in judge does not answer on localhost or a tailnet host" in decision.rationale
+
+
+@pytest.mark.parametrize("endpoint_url", [None, "https://api.example.com/v1"])
+async def test_a_pinned_child_whose_judge_is_refused_does_not_continue_on_an_unchecked_provider(
+    endpoint_url: str | None,
+) -> None:
+    """A refused judge ends the spawn: the child never continues on its own unchecked model.
+
+    ``None`` is a managed deployment with only a policy-LLM factory, which has
+    no local judge endpoint at all.
+    """
+    session_id = "pinned-brain-refused-judge"
+    remember_session_routing_class(
+        session_id, SessionRoutingClass(routing_enabled=True, pinned_brain=True)
+    )
+    try:
+        client = FakeRoutingClient(
+            RoutingResult(model=CLAUDE_MODEL, rationale="cheapest", harness="claude-native"),
+            endpoint_url=endpoint_url,
+        )
+        decision = await resolve_subagent_route(
+            session_id,
+            _request(harness="claude-native", prompt="review the diff"),
+            caps=FakeCaps(routing_client=client),
+            catalog={"self": [CLAUDE_MODEL]},
+        )
+    finally:
+        forget_session_routing_class(session_id)
+    assert client.calls == []
+    assert decision.action == "deny"
+    assert decision.model is None
+    assert decision.harness is None
 
 
 async def test_a_public_judge_still_routes_a_spawn_that_is_not_pinned() -> None:

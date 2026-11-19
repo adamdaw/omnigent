@@ -32,6 +32,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from tests.server.helpers import (
     FakeCaps,
     FakeRoutingClient,
+    build_agent_bundle,
     create_test_agent,
     echo_runner_client,
 )
@@ -1954,6 +1955,82 @@ async def test_a_pinned_brains_child_is_not_routed_by_a_judge_on_a_public_host(
     assert refreshed is not None
     assert refreshed.model_override is None
     assert refreshed.harness_override != "pi"
+
+
+async def _bundle_child_create(
+    client: httpx.AsyncClient,
+    parent_id: str,
+    *,
+    agent_name: str,
+    harness: str,
+    model_override: str | None,
+) -> httpx.Response:
+    """POST a child create whose agent arrives as an uploaded bundle.
+
+    :param client: Test HTTP client.
+    :param parent_id: The pinned brain's session id.
+    :param agent_name: Name written into the uploaded bundle.
+    :param harness: Harness the bundle's executor declares.
+    :param model_override: The child's requested model, or ``None``.
+    :returns: The raw create response.
+    """
+    bundle = build_agent_bundle(
+        name=agent_name,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
+    metadata: dict[str, Any] = {"parent_session_id": parent_id}
+    if model_override is not None:
+        metadata["model_override"] = model_override
+    return await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps(metadata)},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+
+
+async def test_a_bundle_created_pinned_child_outside_its_accounts_is_refused(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The bundle create path holds the same account boundary as the agent-id path."""
+    _agent, parent, _conv_store = await _pinned_brain_parent(
+        client,
+        db_uri,
+        agent_name="pinned-brain-bundle-child-refused",
+        smart_routing_harness="pinned",
+    )
+    refused = await _bundle_child_create(
+        client,
+        parent.id,
+        agent_name="bundle-child-outside",
+        harness="claude-native",
+        model_override=OUTSIDE_CLAUDE_MODEL,
+    )
+    assert refused.status_code == 400, refused.text
+    assert "outside the accounts of its pinned brain" in refused.text
+
+
+async def test_a_bundle_created_pinned_child_inside_its_accounts_is_created(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _agent, parent, conv_store = await _pinned_brain_parent(
+        client,
+        db_uri,
+        agent_name="pinned-brain-bundle-child-allowed",
+        smart_routing_harness="pinned",
+    )
+    allowed = await _bundle_child_create(
+        client,
+        parent.id,
+        agent_name="bundle-child-inside",
+        harness="claude-native",
+        model_override=INSIDE_PI_MODEL,
+    )
+    assert allowed.status_code == 201, allowed.text
+    child = conv_store.get_conversation(str(allowed.json()["session_id"]))
+    assert child is not None
+    assert child.parent_conversation_id == parent.id
 
 
 async def test_a_forced_substitution_past_the_guard_is_denied_before_the_turn(

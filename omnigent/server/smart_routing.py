@@ -17,6 +17,7 @@ import ipaddress
 import json
 import logging
 import re
+import socket
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -273,14 +274,43 @@ def pinned_brain_account_allows(harness: str | None, model: str | None = None) -
 _TAILNET_ADDRESSES = ipaddress.ip_network("100.64.0.0/10")
 
 
+def _resolves_into_tailnet(host: str) -> bool:
+    """Whether every address *host* resolves to is loopback or tailnet.
+
+    A ``*.ts.net`` name is not proof of a tailnet host: Tailscale Funnel
+    publishes a node's services on the public internet under that same suffix.
+    So the resolved addresses decide. Fails closed: a resolution error or an
+    empty answer is not local.
+
+    :param host: A lowercase hostname, e.g. ``"judge.example-tailnet.ts.net"``.
+    :returns: ``True`` only when every resolved address is loopback or in
+        ``100.64.0.0/10``.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return False
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for info in infos:
+        try:
+            addresses.append(ipaddress.ip_address(info[4][0].split("%", 1)[0]))
+        except ValueError:
+            return False
+    if not addresses:
+        return False
+    return all(address.is_loopback or address in _TAILNET_ADDRESSES for address in addresses)
+
+
 def judge_endpoint_is_local(url: str | None) -> bool:
     """Whether a judge endpoint is localhost, loopback, or a tailnet host.
 
     Fails closed: a missing or unparseable URL, or any other host, is not local.
+    A ``*.ts.net`` name counts only when it resolves wholly into the tailnet's
+    CGNAT block, since Funnel hosts under that suffix are public.
 
     :param url: The judge endpoint's base URL, or ``None`` when it has none.
     :returns: ``True`` when the host is localhost, a loopback or tailnet address,
-        or a ``*.ts.net`` name.
+        or a ``*.ts.net`` name that resolves into the tailnet.
     """
     if not url:
         return False
@@ -290,12 +320,12 @@ def judge_endpoint_is_local(url: str | None) -> bool:
         return False
     if not host:
         return False
-    if host == "localhost" or host.endswith((".localhost", ".ts.net")):
+    if host == "localhost" or host.endswith(".localhost"):
         return True
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        return False
+        return host.endswith(".ts.net") and _resolves_into_tailnet(host)
     return address.is_loopback or address in _TAILNET_ADDRESSES
 
 

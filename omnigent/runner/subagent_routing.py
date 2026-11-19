@@ -837,7 +837,12 @@ async def _decide(
 
     backends = backends_from_caps(caps)
     if account_bound and (refusal := pinned_brain_router_refusal(backends)) is not None:
-        return _unavailable_decision(f"refused for a pinned brain's spawns: {refusal}")
+        # Terminal: an unchecked judge must not let the spawn continue on a
+        # provider the boundary never vetted, so this is a deny, not an allow.
+        return SubagentRouteDecision(
+            action="deny",
+            rationale=f"Spawn refused for a pinned brain: {refusal}",
+        )
     if select_router(backends, gateway_backed=gateway_backed) is None:
         return _unavailable_decision("no routing client configured")
 

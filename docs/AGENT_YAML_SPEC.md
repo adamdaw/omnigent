@@ -123,6 +123,18 @@ executor:
   another family. Any other spawn keeps the family rule, and a create asking
   for `harness_override: auto` is refused.
 
+A pinned brain's children are kept inside the brain's configured accounts, and
+this is a deliberate change in behaviour: a spawn is **refused** (it is not
+allowed to continue on its own model) when the brain has no local judge endpoint.
+The built-in judge must answer on localhost, a loopback address, or a tailnet
+address. A `*.ts.net` name counts only when it resolves wholly into `100.64.0.0/10`,
+because Tailscale Funnel publishes `*.ts.net` hosts on the public internet. An
+external router is refused too. Managed deployments that configure only a
+policy-LLM factory therefore have no local judge, and their pinned brains' children
+are refused until a local judge endpoint is configured. A create that would place a
+child outside the accounts (harness or model) is refused with 400, including a
+bundle-uploaded child.
+
 The `cursor` harness (Cursor's `cursor-agent`) is the exception: it talks
 only to Cursor's own backend and has no custom API base-URL, so the Databricks
 gateway / `auth.type: databricks` does not apply. Authenticate it with

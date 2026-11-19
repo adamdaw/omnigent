@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -3776,7 +3777,6 @@ def test_pinned_brain_account_boundary(
         ("http://localhost:8080/v1", True),
         ("http://127.0.0.1:11434", True),
         ("http://[::1]:8080", True),
-        ("http://judge.example-tailnet.ts.net:8080", True),
         ("http://100.100.20.30:8080", True),
         # Public hosts, including a bare public address and an unlisted CGNAT-adjacent one.
         ("https://api.example.com/v1", False),
@@ -3788,5 +3788,57 @@ def test_pinned_brain_account_boundary(
         ("not a url", False),
     ],
 )
-def test_judge_endpoint_must_be_local_or_tailnet(url: str | None, local: bool) -> None:
+def test_judge_endpoint_must_be_local_or_tailnet(
+    url: str | None, local: bool, judge_resolver: dict[str, list[str]]
+) -> None:
     assert judge_endpoint_is_local(url) is local
+
+
+@pytest.fixture
+def judge_resolver(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """Stub DNS for the judge check: host -> addresses. An unlisted host fails to resolve."""
+    answers: dict[str, list[str]] = {}
+
+    def getaddrinfo(host: str, port: object, *args: object, **kwargs: object) -> list[tuple]:
+        if host not in answers:
+            raise socket.gaierror(f"no stubbed answer for {host}")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, 0)) for addr in answers[host]]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    return answers
+
+
+def test_ts_net_judge_resolving_into_the_tailnet_is_local(
+    judge_resolver: dict[str, list[str]],
+) -> None:
+    judge_resolver["judge.example-tailnet.ts.net"] = ["100.100.20.30"]
+    assert judge_endpoint_is_local("http://judge.example-tailnet.ts.net:8080") is True
+
+
+def test_ts_net_judge_resolving_to_a_public_address_is_refused(
+    judge_resolver: dict[str, list[str]],
+) -> None:
+    """A Funnel host is publicly reachable under *.ts.net, so its public address decides."""
+    judge_resolver["funnel.example-tailnet.ts.net"] = ["203.0.113.7"]
+    assert judge_endpoint_is_local("https://funnel.example-tailnet.ts.net") is False
+
+
+def test_ts_net_judge_with_one_public_address_among_tailnet_ones_is_refused(
+    judge_resolver: dict[str, list[str]],
+) -> None:
+    judge_resolver["mixed.example-tailnet.ts.net"] = ["100.100.20.30", "203.0.113.7"]
+    assert judge_endpoint_is_local("https://mixed.example-tailnet.ts.net") is False
+
+
+def test_ts_net_judge_that_does_not_resolve_is_refused(
+    judge_resolver: dict[str, list[str]],
+) -> None:
+    """Fails closed: no answer from the resolver is not a tailnet host."""
+    assert judge_endpoint_is_local("https://gone.example-tailnet.ts.net") is False
+
+
+def test_ts_net_judge_resolving_to_no_addresses_is_refused(
+    judge_resolver: dict[str, list[str]],
+) -> None:
+    judge_resolver["empty.example-tailnet.ts.net"] = []
+    assert judge_endpoint_is_local("https://empty.example-tailnet.ts.net") is False

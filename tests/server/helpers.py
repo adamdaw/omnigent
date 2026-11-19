@@ -1195,7 +1195,7 @@ class CapturingRunnerClient:
 
 
 #: A judge endpoint on the tailnet, which a pinned brain's child may use.
-TAILNET_JUDGE_URL = "http://judge.example-tailnet.ts.net:8080"
+TAILNET_JUDGE_URL = "http://100.100.20.30:8080"  # a CGNAT tailnet address, no DNS
 
 
 class FakeRoutingClient:
