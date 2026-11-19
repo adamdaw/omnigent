@@ -143,6 +143,7 @@ def copy_session(
     source_id: str,
     title: str,
     agent_id: str,
+    pins_brain: bool,
     created_by: str | None,
     project_id: str | None,
     carry_history_into_native: bool,
@@ -166,6 +167,9 @@ def copy_session(
     :param source_id: The session to copy, e.g. ``"conv_abc123"``.
     :param title: Title of the copy.
     :param agent_id: Existing agent the copy runs.
+    :param pins_brain: Whether that agent's spec pins its Smart Routing brain
+        (``_agent_pins_its_brain``); the copy then carries the pinned-brain
+        label, which the store never copies from the source.
     :param created_by: The owner the copy is created for.
     :param project_id: First-class project to file the copy into, or ``None``.
     :param carry_history_into_native: Mark the copy so a native harness
@@ -187,6 +191,10 @@ def copy_session(
     :raises SourceCopyIncompleteError: When a file row could not be created.
     """
     from omnigent.db.utils import generate_file_id
+    from omnigent.runner.subagent_routing import PINNED_BRAIN_LABEL_KEY
+
+    if pins_brain:
+        labels = {**(labels or {}), PINNED_BRAIN_LABEL_KEY: "1"}
 
     file_id_map: dict[str, str] = {}
     source_files: list[Any] = []

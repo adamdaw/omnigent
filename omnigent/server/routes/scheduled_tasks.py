@@ -828,6 +828,9 @@ def create_scheduled_tasks_router(
 
         # _require_source_session rejects a session without an agent.
         assert source.agent_id is not None
+        from omnigent.server.routes._sessions.helpers import _agent_pins_its_brain
+
+        source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
         try:
             copy = await asyncio.to_thread(
                 copy_session,
@@ -838,6 +841,8 @@ def create_scheduled_tasks_router(
                 title=source_copy_title(source.title, name),
                 # The copy keeps the session's agent; each run binds the task's own.
                 agent_id=source.agent_id,
+                pins_brain=source_agent is not None
+                and await asyncio.to_thread(_agent_pins_its_brain, source_agent, agent_cache),
                 created_by=owner,
                 project_id=project_id,
                 carry_history_into_native=carry,
