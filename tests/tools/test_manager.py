@@ -6,8 +6,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -494,8 +493,8 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_create" in names
     # The dispatch grant brings model awareness along with it.
     assert "sys_list_models" in names
-    # Intelligent routing advisor stays hidden when routing is disabled.
-    assert "sys_advise_models" not in names
+    # Advice is handled by the server.
+    assert "sys_advise_models" in names
     # Sharing is DECOUPLED from spawn — its own `share:` flag governs it,
     # so `spawn: true` alone (share defaulting to `none`) does NOT
     # register it. A regression coupling them would re-expose sharing to
@@ -558,7 +557,7 @@ def test_declared_agents_grant_send_close_but_not_create() -> None:
     assert "sys_session_create" not in names
     # Model awareness rides the same grant as send.
     assert "sys_list_models" in names
-    # Advisor is capability-gated — absent without a routing client.
+    # Advice requires the separate spawn grant.
     assert "sys_advise_models" not in names
     # Declaring sub-agents does NOT enable sharing — that is the separate
     # `share:` flag's job, decoupled from the spawn/agents grant.
@@ -574,39 +573,29 @@ def _spawn_spec() -> AgentSpec:
     return AgentSpec(spec_version=1, spawn=True)
 
 
-def test_advise_models_hidden_when_routing_disabled() -> None:
-    """sys_advise_models must not appear when no router is configured."""
-    caps = _FakeRoutingCaps(routing_client=None)
-    with patch("omnigent.runtime._globals._caps", new=caps):
-        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
-    assert "sys_list_models" in names
+def test_advise_models_exposed_for_spawn_agent() -> None:
+    names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_advise_models" in names
+
+
+def test_advise_models_hidden_without_spawn() -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        tools=ToolsConfig(agents=["researcher"]),
+        sub_agents=[AgentSpec(spec_version=1, name="researcher")],
+    )
+    names = {s["function"]["name"] for s in ToolManager(spec).get_tool_schemas()}
     assert "sys_advise_models" not in names
 
 
-def test_advise_models_exposed_from_a_backends_only_deployment() -> None:
-    """The gate is "some source can answer", not "a legacy client is set".
+async def test_advise_models_server_reports_routing_unavailable() -> None:
+    from omnigent.server.routes._sessions.helpers import _handle_advise_models_mcp
 
-    A deployment that configures only ``routing_backends`` routes, so hiding the
-    tool there would advertise routing-off while the server routes anyway.
-    """
-    from omnigent.server.routing_backend import RoutingBackends
-
-    caps = SimpleNamespace(
-        routing_client=None,
-        routing_backends=RoutingBackends(local=cast("Any", object())),
-    )
-    with patch("omnigent.runtime._globals._caps", new=caps):
-        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
-    assert "sys_advise_models" in names
-
-
-def test_advise_models_exposed_when_routing_enabled() -> None:
-    """sys_advise_models is advertised alongside send when routing is configured."""
-    caps = _FakeRoutingCaps(routing_client=object())
-    with patch("omnigent.runtime._globals._caps", new=caps):
-        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
-    assert "sys_list_models" in names
-    assert "sys_advise_models" in names
+    with patch("omnigent.runtime._globals._caps", new=_FakeRoutingCaps()):
+        response = await _handle_advise_models_mcp(1, None, {"tasks": []}, None)
+    payload = json.loads(response.body)
+    result = json.loads(payload["result"]["content"][0]["text"])
+    assert result == {"router_on": False, "recommendations": []}
 
 
 def test_share_non_public_registers_share_tool_without_public() -> None:
