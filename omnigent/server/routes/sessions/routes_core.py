@@ -247,6 +247,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _session_is_starting,
     _settle_orphaned_running_rows,
     _spawn_archive_stop,
+    _spec_brain_routing,
     _validate_session_model_selection,
     ensure_runner_connected,
 )
@@ -5225,6 +5226,20 @@ def register_core_routes(
             dropped_label_keys_set |= (
                 BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS & source.labels.keys()
             )
+        # The Smart Routing pins are privileges of one session and one parent,
+        # never copied: the fork takes the pinned-brain label from its own
+        # target spec below, and is no parent's authorized worker.
+        from omnigent.runner.subagent_routing import (
+            PINNED_BRAIN_LABEL_KEY,
+            PINNED_BRAIN_WORKER_LABEL_KEY,
+        )
+        from omnigent.server.routes._sessions.helpers import PINNED_BRAIN_VALUE
+
+        dropped_label_keys_set.update(
+            key
+            for key in (PINNED_BRAIN_LABEL_KEY, PINNED_BRAIN_WORKER_LABEL_KEY)
+            if key in source.labels
+        )
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
@@ -5273,6 +5288,21 @@ def register_core_routes(
                 fresh_launch_args = fresh_launch_args[1:]
             if fresh_launch_args != source.terminal_launch_args:
                 override_launch_args, launch_args_set = fresh_launch_args, True
+
+        from omnigent.runtime import get_agent_cache
+
+        fork_spec_cache = agent_cache
+        if fork_spec_cache is None:
+            try:
+                fork_spec_cache = get_agent_cache()
+            except RuntimeError:
+                # No runtime, no spec to read: the fork simply carries no pin.
+                fork_spec_cache = None
+        if (
+            await asyncio.to_thread(_spec_brain_routing, base_agent, fork_spec_cache)
+            == PINNED_BRAIN_VALUE
+        ):
+            extra_labels[PINNED_BRAIN_LABEL_KEY] = "1"
 
         # Side chats use the source for shared-runner routing and stay hidden
         # from the sidebar while appearing in the Workspace rail.
