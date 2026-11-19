@@ -12574,7 +12574,9 @@ def _assert_pinned_child_account(
     """Refuse a create whose harness or model is outside a pinned brain's accounts.
 
     An ``auto`` child has no harness or model yet; its first routed pick is
-    checked where that pick is applied.
+    checked where that pick is applied. Without a ``model_override`` the child
+    runs on its spec's model, so that is the one checked; a spec that cannot be
+    loaded is refused rather than created on a model nobody checked.
 
     :param agent: The agent row the child is created from.
     :param body: The validated child create request.
@@ -12582,14 +12584,56 @@ def _assert_pinned_child_account(
     :param model_override: The model the row is about to be created with.
     :param agent_cache: Cache for loading the parsed bundle.
     :raises OmnigentError: ``invalid_input`` when the harness or model is outside
-        the boundary.
+        the boundary, or the spec's model cannot be resolved.
     """
     if harness_override == "auto":
         return
+    spec = _create_resolved_spec(agent, body.sub_agent_name, agent_cache)
     harness = harness_override or _create_resolved_harness(
         agent, body.harness_override, agent_cache
     )
-    _assert_inside_account_boundary(harness, model_override)
+    if not harness_override and body.sub_agent_name and spec is not None:
+        # A declared worker runs on its own spec's harness, not its bundle root's.
+        from omnigent.harness_aliases import canonicalize_harness
+
+        harness = canonicalize_harness(_spec_harness(spec)) or harness
+    model = model_override
+    if model is None:
+        if spec is None:
+            raise OmnigentError(
+                f"child refused: the model of agent {agent.name!r} cannot be resolved "
+                "to check it against the accounts of its pinned brain",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        model = spec.executor.model
+    _assert_inside_account_boundary(harness, model)
+
+
+def _create_resolved_spec(
+    agent: Agent,
+    sub_agent_name: str | None,
+    agent_cache: AgentCache | None,
+) -> AgentSpec | None:
+    """Load the spec a child will run on, before any row exists.
+
+    :param agent: The agent row the child is created from.
+    :param sub_agent_name: The child's sub-agent name, if any; its own spec in
+        the bundle wins over the root, as at launch.
+    :param agent_cache: Cache for loading the parsed bundle.
+    :returns: The child's spec, or ``None`` when it cannot be loaded.
+    """
+    if agent_cache is None:
+        return None
+    try:
+        spec = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        ).spec
+    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+        _logger.debug("pinned child create: agent %r failed to load", agent.name, exc_info=True)
+        return None
+    if sub_agent_name:
+        return _find_spec_by_name(spec, sub_agent_name) or spec
+    return spec
 
 
 def _spec_pins_its_brain(
@@ -14178,7 +14222,8 @@ def _create_session_from_bundle(
     if metadata.parent_session_id is not None:
         parent = conversation_store.get_conversation(metadata.parent_session_id)
         if pinned_brain_session(parent) and (harness := _spec_harness(spec)) != "auto":
-            _assert_inside_account_boundary(harness, inference_model)
+            # Without a requested model the child runs on its spec's own.
+            _assert_inside_account_boundary(harness, inference_model or spec.executor.model)
 
     if agent_store is not None and metadata.parent_session_id is None:
         agent = uploaded_agent_for(

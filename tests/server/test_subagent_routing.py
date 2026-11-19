@@ -476,6 +476,61 @@ async def test_a_pinned_child_whose_judge_is_refused_does_not_continue_on_an_unc
     assert decision.harness is None
 
 
+_DISPATCHED_CHILD_LABELS = {PINNED_BRAIN_WORKER_LABEL_KEY: "conv_brain"}
+
+
+@pytest.mark.parametrize(
+    ("endpoint_url", "offered_outside", "expected_action", "expected_model"),
+    [
+        ("https://api.example.com/v1", False, "deny", None),
+        (None, True, "deny", None),
+        (None, False, "rewrite", CLAUDE_MODEL),
+    ],
+    ids=["public-judge-refused", "outside-candidate-filtered", "in-account-routes"],
+)
+async def test_a_dispatched_child_of_a_pinned_brain_is_account_bound_in_the_runner(
+    endpoint_url: str | None,
+    offered_outside: bool,
+    expected_action: str,
+    expected_model: str | None,
+) -> None:
+    """A child the server stamped as a pinned brain's worker keeps the brain's boundary.
+
+    The class is derived from the child's own labels, as the runner does at init.
+    """
+    outside = "system.ai.claude-foo-9"
+    session_id = "pinned-brain-dispatched-child"
+    remember_session_routing_class(
+        session_id,
+        routing_class_from_snapshot(
+            cost_control_mode="on",
+            harness_override="claude-native",
+            labels=_DISPATCHED_CHILD_LABELS,
+        ),
+    )
+    try:
+        client = FakeRoutingClient(
+            RoutingResult(
+                model=outside if offered_outside else CLAUDE_MODEL,
+                rationale="cheapest",
+                harness="claude-native",
+            ),
+            **({"endpoint_url": endpoint_url} if endpoint_url else {}),
+        )
+        decision = await resolve_subagent_route(
+            session_id,
+            _request(harness="claude-native", prompt="review the diff"),
+            caps=FakeCaps(routing_client=client),
+            catalog={"self": [CLAUDE_MODEL, outside]},
+        )
+    finally:
+        forget_session_routing_class(session_id)
+    offered = {m for call in client.offered for ms in call.values() for m in ms}
+    assert outside not in offered
+    assert decision.action == expected_action
+    assert decision.model == expected_model
+
+
 async def test_a_public_judge_still_routes_a_spawn_that_is_not_pinned() -> None:
     """The endpoint check binds pinned brains only; other spawns keep their judge."""
     client = FakeRoutingClient(
@@ -1366,6 +1421,13 @@ def test_subagent_routing_enabled_is_two_state(override: str | None, expected: b
             "claude-native",
             {PINNED_BRAIN_LABEL_KEY: "1"},
             SessionRoutingClass(routing_enabled=True, pinned_brain=True),
+        ),
+        # A pinned brain's dispatched child is routed itself, inside the brain's accounts.
+        (
+            "on",
+            "claude-native",
+            {PINNED_BRAIN_WORKER_LABEL_KEY: "conv_brain"},
+            SessionRoutingClass(routing_enabled=True, turn_routing=True, pinned_brain_worker=True),
         ),
     ],
 )

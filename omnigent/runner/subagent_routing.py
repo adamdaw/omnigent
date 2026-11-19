@@ -250,12 +250,21 @@ class SessionRoutingClass:
         extended catalog and its spawn routing.
     :param pinned_brain: The session is a pinned Smart Routing brain. Its
         spawns are confined to the session's configured accounts.
+    :param pinned_brain_worker: The session is a child the server authorized
+        under a pinned brain (:data:`PINNED_BRAIN_WORKER_LABEL_KEY`). It is
+        routed like any child, inside the same accounts as its brain.
     """
 
     routing_enabled: bool = False
     auto_harness: bool = False
     turn_routing: bool = False
     pinned_brain: bool = False
+    pinned_brain_worker: bool = False
+
+    @property
+    def account_bound(self) -> bool:
+        """Whether this session's spawns are confined to the brain's accounts."""
+        return self.pinned_brain or self.pinned_brain_worker
 
 
 #: The class a session with no recorded routing state is treated as. Read by
@@ -296,11 +305,14 @@ def routing_class_from_snapshot(
     already_routed = bool(labels is not None and labels.get(ROUTING_DECISION_LABEL_KEY))
     # A pinned brain is never model-routed itself; only its spawns are.
     pinned_brain = bool(labels is not None and labels.get(PINNED_BRAIN_LABEL_KEY) == "1")
+    # The label the server stamps on a pinned brain's dispatched child.
+    pinned_brain_worker = bool(labels is not None and labels.get(PINNED_BRAIN_WORKER_LABEL_KEY))
     return SessionRoutingClass(
         routing_enabled=routes,
         auto_harness=auto,
         turn_routing=routes and not already_routed and not pinned_brain,
         pinned_brain=pinned_brain,
+        pinned_brain_worker=pinned_brain_worker,
     )
 
 
@@ -830,10 +842,10 @@ async def _decide(
         select_router,
     )
 
-    # A pinned brain's spawns stay inside its configured accounts (see
-    # ``pinned_brain_account_allows``). Read off the session's own routing class,
-    # so the boundary holds wherever the spawn is decided.
-    account_bound = session_routing_class(session_id).pinned_brain
+    # A pinned brain's spawns, and its dispatched children's, stay inside its
+    # configured accounts (see ``pinned_brain_account_allows``). Read off the
+    # session's own routing class, so the boundary holds wherever it is decided.
+    account_bound = session_routing_class(session_id).account_bound
 
     backends = backends_from_caps(caps)
     if account_bound and (refusal := pinned_brain_router_refusal(backends)) is not None:

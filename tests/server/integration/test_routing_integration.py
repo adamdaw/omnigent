@@ -1316,9 +1316,24 @@ async def _pinned_brain_parent(
         client,
         name=agent_name,
         executor={"type": "omnigent", "config": config},
+        # Each worker runs on a model inside a pinned brain's accounts.
         sub_agents=[
-            {"name": "pi", "executor": {"type": "omnigent", "config": {"harness": "pi"}}},
-            {"name": "codex", "executor": {"type": "omnigent", "config": {"harness": "codex"}}},
+            {
+                "name": "pi",
+                "executor": {
+                    "type": "omnigent",
+                    "model": INSIDE_PI_MODEL,
+                    "config": {"harness": "pi"},
+                },
+            },
+            {
+                "name": "codex",
+                "executor": {
+                    "type": "omnigent",
+                    "model": "system.ai.gpt-5-5",
+                    "config": {"harness": "codex"},
+                },
+            },
         ],
     )
     parent = await client.post(
@@ -1964,6 +1979,7 @@ async def _bundle_child_create(
     agent_name: str,
     harness: str,
     model_override: str | None,
+    spec_model: str | None = None,
 ) -> httpx.Response:
     """POST a child create whose agent arrives as an uploaded bundle.
 
@@ -1972,12 +1988,13 @@ async def _bundle_child_create(
     :param agent_name: Name written into the uploaded bundle.
     :param harness: Harness the bundle's executor declares.
     :param model_override: The child's requested model, or ``None``.
+    :param spec_model: The model the bundle's executor declares, or ``None``.
     :returns: The raw create response.
     """
-    bundle = build_agent_bundle(
-        name=agent_name,
-        executor={"type": "omnigent", "config": {"harness": harness}},
-    )
+    executor: dict[str, Any] = {"type": "omnigent", "config": {"harness": harness}}
+    if spec_model is not None:
+        executor["model"] = spec_model
+    bundle = build_agent_bundle(name=agent_name, executor=executor)
     metadata: dict[str, Any] = {"parent_session_id": parent_id}
     if model_override is not None:
         metadata["model_override"] = model_override
@@ -2031,6 +2048,37 @@ async def test_a_bundle_created_pinned_child_inside_its_accounts_is_created(
     child = conv_store.get_conversation(str(allowed.json()["session_id"]))
     assert child is not None
     assert child.parent_conversation_id == parent.id
+
+
+@pytest.mark.parametrize(
+    ("spec_model", "expected_status"),
+    [(OUTSIDE_CLAUDE_MODEL, 400), (INSIDE_PI_MODEL, 201)],
+    ids=["outside", "inside"],
+)
+async def test_a_bundle_created_pinned_child_is_checked_on_its_spec_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    spec_model: str,
+    expected_status: int,
+) -> None:
+    """With no requested model, the bundle child's own spec model is the one checked."""
+    _agent, parent, _conv_store = await _pinned_brain_parent(
+        client,
+        db_uri,
+        agent_name=f"pinned-brain-bundle-spec-model-{expected_status}",
+        smart_routing_harness="pinned",
+    )
+    created = await _bundle_child_create(
+        client,
+        parent.id,
+        agent_name=f"bundle-child-spec-model-{expected_status}",
+        harness="claude-native",
+        model_override=None,
+        spec_model=spec_model,
+    )
+    assert created.status_code == expected_status, created.text
+    if expected_status == 400:
+        assert "outside the accounts of its pinned brain" in created.text
 
 
 async def test_a_forced_substitution_past_the_guard_is_denied_before_the_turn(
@@ -2107,6 +2155,73 @@ async def test_a_pinned_brains_child_create_naming_a_model_outside_its_accounts_
         },
     )
     assert allowed.status_code == 201, allowed.text
+
+
+@pytest.mark.parametrize(
+    ("spec_model", "expected_status"),
+    [(OUTSIDE_CLAUDE_MODEL, 400), (INSIDE_PI_MODEL, 201)],
+    ids=["outside", "inside"],
+)
+async def test_a_pinned_brains_child_create_is_checked_on_its_spec_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    spec_model: str,
+    expected_status: int,
+) -> None:
+    """With no ``model_override`` the child runs on, and is checked on, its spec's model."""
+    _agent, parent, _conv_store = await _pinned_brain_parent(
+        client,
+        db_uri,
+        agent_name=f"pinned-brain-spec-model-{expected_status}",
+        smart_routing_harness="pinned",
+    )
+    child_agent = await create_test_agent(
+        client,
+        name=f"pinned-brain-spec-model-child-{expected_status}",
+        executor={"type": "omnigent", "model": spec_model, "config": {"harness": "claude-sdk"}},
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": child_agent["id"],
+            "parent_session_id": parent.id,
+            "harness_override": "claude-sdk",
+        },
+    )
+    assert created.status_code == expected_status, created.text
+    if expected_status == 400:
+        assert "outside the accounts" in created.text
+
+
+async def test_a_pinned_brains_child_whose_spec_model_cannot_be_resolved_is_refused(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A dispatch whose spec cannot be loaded is refused, never created on an unchecked model."""
+    from omnigent.runtime.agent_cache import AgentCache
+
+    agent, parent, _conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-unresolved-spec", smart_routing_harness="pinned"
+    )
+    real_load = AgentCache.load
+
+    def _load(self: AgentCache, agent_id: str, *args: Any, **kwargs: Any) -> Any:
+        if agent_id == agent["id"]:
+            raise OSError("bundle unavailable")
+        return real_load(self, agent_id, *args, **kwargs)
+
+    with patch.object(AgentCache, "load", _load):
+        refused = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent.id,
+                "sub_agent_name": "pi",
+                "title": "pi:task",
+            },
+        )
+    assert refused.status_code == 400, refused.text
+    assert "cannot be resolved" in refused.text
 
 
 @pytest.mark.parametrize(
@@ -2629,7 +2744,11 @@ async def _pinned_brain_worker_pane(
         sub_agents=[
             {
                 "name": "claude_code",
-                "executor": {"type": "omnigent", "config": {"harness": "claude-native"}},
+                "executor": {
+                    "type": "omnigent",
+                    "model": "opus",
+                    "config": {"harness": "claude-native"},
+                },
             }
         ],
     )
