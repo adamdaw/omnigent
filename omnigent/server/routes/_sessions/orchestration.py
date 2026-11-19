@@ -13196,7 +13196,10 @@ async def _create_session_from_existing_agent(
         if (
             _parent_for_routing is not None
             and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
-            and auto_harness_session(_parent_for_routing)
+            and (
+                auto_harness_session(_parent_for_routing)
+                or pinned_brain_session(_parent_for_routing)
+            )
             and not await asyncio.to_thread(_spawn_pins_its_harness, body, agent, agent_cache)
         ):
             try:
@@ -13215,7 +13218,8 @@ async def _create_session_from_existing_agent(
             _declared_worker_harnesses, body, agent, _parent_for_routing, agent_cache
         )
         _pinned_brain_worker = _authorizes_pinned_brain_worker(body, _worker_harnesses)
-        if _pinned_spawn_family(_parent_for_routing) is not None:
+        # A child the router picks for (forced to auto above) may land in any family.
+        if _pinned_spawn_family(_parent_for_routing) is not None and not _force_auto_for_child:
             _reject_out_of_family_child(
                 _parent_for_routing,
                 await asyncio.to_thread(
@@ -14076,11 +14080,9 @@ def _create_session_from_bundle(
         metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
 
     # An uploaded bundle's top-level session is a pinned brain, as on any other
-    # create. An invalid value is left to the routing create that reports it.
-    try:
-        _bundle_pins_brain = _validated_spec_smart_routing_harness(spec) == PINNED_BRAIN_VALUE
-    except OmnigentError:
-        _bundle_pins_brain = False
+    # create. An invalid value raises here: the upload path never reaches the
+    # routing create that would otherwise report it.
+    _bundle_pins_brain = _validated_spec_smart_routing_harness(spec) == PINNED_BRAIN_VALUE
     if metadata.parent_session_id is None and _bundle_pins_brain:
         metadata = metadata.model_copy(
             update={"labels": {**(metadata.labels or {}), PINNED_BRAIN_LABEL_KEY: "1"}}

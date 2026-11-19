@@ -1419,15 +1419,46 @@ async def test_a_pinned_brain_may_dispatch_a_declared_worker_in_another_family(
     assert set(routing_client.offered[0]) == {harness}
 
 
-async def test_a_pinned_brain_still_refuses_an_undeclared_cross_family_child(
+async def test_a_pinned_brain_routes_an_undeclared_cross_family_child(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
+    # No harness override and no declared worker: the router picks the child's
+    # family, so the create is an auto child and the codex-only agent is no refusal.
     _agent, parent, _conv_store = await _pinned_brain_parent(
         client, db_uri, agent_name="pinned-brain-undeclared", smart_routing_harness="pinned"
     )
     child = await _create_child(
         client, parent.id, agent_name="pinned-brain-undeclared-codex", harness="codex"
+    )
+    assert child.status_code == 201, child.text
+    body = child.json()
+    assert body["harness"] == "auto"
+    assert body["labels"].get(AUTO_HARNESS_LABEL_KEY) == "1"
+    assert parent.labels.get(PINNED_BRAIN_LABEL_KEY) == "1"
+    assert AUTO_HARNESS_LABEL_KEY not in parent.labels
+
+
+async def test_a_pinned_brain_still_refuses_an_explicitly_pinned_cross_family_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    # An explicit harness_override is the caller's pin, not a router pick.
+    _agent, parent, _conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-explicit", smart_routing_harness="pinned"
+    )
+    child_agent = await create_test_agent(
+        client,
+        name="pinned-brain-explicit-codex",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    child = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": child_agent["id"],
+            "parent_session_id": parent.id,
+            "harness_override": "codex",
+        },
     )
     assert child.status_code == 400, child.text
     assert "model family" in child.text

@@ -759,17 +759,16 @@ async def test_a_spec_without_the_opt_in_keeps_its_pinned_harness(
 
 
 async def test_a_non_auto_opt_in_value_is_rejected(client: httpx.AsyncClient) -> None:
-    agent = await create_test_agent(
-        client,
-        name="spec-opt-in-bad-value",
-        executor={
-            "type": "omnigent",
-            "config": {"harness": "claude-sdk", "smart_routing_harness": "codex"},
-        },
-    )
-    created = await _create_opt_in_session(client, str(agent["id"]))
-    assert created.status_code == 400, created.text
-    assert "smart_routing_harness" in created.text
+    # The bundle upload reports the bad value itself, so the agent is never created.
+    with pytest.raises(AssertionError, match="smart_routing_harness"):
+        await create_test_agent(
+            client,
+            name="spec-opt-in-bad-value",
+            executor={
+                "type": "omnigent",
+                "config": {"harness": "claude-sdk", "smart_routing_harness": "codex"},
+            },
+        )
 
 
 # ── Create-time subagent-routing stamp ──────────────────────────────────────
