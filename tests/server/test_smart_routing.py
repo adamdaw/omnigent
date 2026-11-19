@@ -3757,6 +3757,17 @@ async def test_a_runner_rebind_invalidates_the_routing_catalog() -> None:
         ("claude-sdk", "system.ai.claude-foo-9", False),
         # A model of the wrong family for the harness.
         ("claude-sdk", "system.ai.gpt-5-5", False),
+        # The claude and codex CLI subscription rows, bare ids, in their own family.
+        ("claude-native", "opus", True),
+        ("claude-native", "sonnet", True),
+        ("claude-native", "haiku", True),
+        ("claude-native", "claude-fable-5-2[1m]", True),
+        ("codex-native", "gpt-6.1-sol", True),
+        # A bare subscription id under the other provider's harness is refused.
+        ("codex-native", "opus", False),
+        ("claude-native", "gpt-6.1-sol", False),
+        # A gateway-served id of the same bare model stays refused.
+        ("claude-native", "databricks-claude-sonnet-5", False),
         # An unknown or unresolved harness fails closed.
         ("acp", "system.ai.claude-sonnet-5", False),
         ("auto", None, False),

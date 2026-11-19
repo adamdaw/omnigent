@@ -159,6 +159,33 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
         provenance="probed: pi's own gateway 400s on each of these",
         discovery_gap="a gateway listing advertises these without pi's request-shape limits",
     ),
+    "claude_subscription": StaticModelFallback(
+        model_ids=("opus", "sonnet", "haiku", "claude-fable-5-2[1m]"),
+        owner="Smart Routing (omnigent.server.smart_routing)",
+        provenance=(
+            "the claude CLI's subscription rows as the live catalog lists them: "
+            "bare ids, no provider prefix"
+        ),
+        discovery_gap="a pinned brain's allowlist must name the bare ids the picker serves",
+    ),
+    "codex_subscription": StaticModelFallback(
+        model_ids=(
+            "gpt-6.1-terra",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ),
+        owner="Smart Routing (omnigent.server.smart_routing)",
+        provenance=(
+            "the codex CLI's subscription rows as the live catalog lists them: "
+            "bare ids, no provider prefix"
+        ),
+        discovery_gap="a pinned brain's allowlist must name the bare ids the picker serves",
+    ),
     "codex_native_excluded": StaticModelFallback(
         model_ids=("databricks-gpt-5-4-nano", "system.ai.databricks-gpt-5-4-nano"),
         owner="Native Codex Smart Routing",
@@ -197,6 +224,14 @@ SMART_ROUTING_FAMILY_FALLBACKS = _SMART_ROUTING_FALLBACKS["family_fallbacks"].mo
 
 #: Models pi's own gateway rejects, so the router may not pick them under pi.
 SMART_ROUTING_PI_EXCLUDED = _SMART_ROUTING_FALLBACKS["pi_excluded"].model_ids
+
+#: The claude CLI's subscription rows (bare ids), inside a pinned brain's accounts.
+SMART_ROUTING_CLAUDE_SUBSCRIPTION_MODELS = _SMART_ROUTING_FALLBACKS[
+    "claude_subscription"
+].model_ids
+
+#: The codex CLI's subscription rows (bare ids), inside a pinned brain's accounts.
+SMART_ROUTING_CODEX_SUBSCRIPTION_MODELS = _SMART_ROUTING_FALLBACKS["codex_subscription"].model_ids
 
 #: Models incompatible with native Codex's deferred tool-search requests and history.
 SMART_ROUTING_CODEX_NATIVE_EXCLUDED = _SMART_ROUTING_FALLBACKS["codex_native_excluded"].model_ids

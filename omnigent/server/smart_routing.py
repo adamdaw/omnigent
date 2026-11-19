@@ -27,7 +27,9 @@ from urllib.parse import urlsplit
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.models.model_fallbacks import (
     SMART_ROUTING_CLAUDE_LADDER,
+    SMART_ROUTING_CLAUDE_SUBSCRIPTION_MODELS,
     SMART_ROUTING_CODEX_NATIVE_EXCLUDED,
+    SMART_ROUTING_CODEX_SUBSCRIPTION_MODELS,
     SMART_ROUTING_CURRENT_GENERATION_GPT,
     SMART_ROUTING_FAMILY_FALLBACKS,
     SMART_ROUTING_GPT_LADDER,
@@ -101,6 +103,15 @@ MODEL_LISTS: dict[str, list[str]] = {
 # (:class:`RoutingSettings`) rather than a managed deployment forking this module.
 _CURRENT_GENERATION_MODELS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {"gpt": SMART_ROUTING_CURRENT_GENERATION_GPT}
+)
+
+# The claude and codex CLI logins' own rows, which the live catalog lists as
+# bare ids with no provider prefix. Approved for their own family only.
+_SUBSCRIPTION_MODELS: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "claude": SMART_ROUTING_CLAUDE_SUBSCRIPTION_MODELS,
+        "gpt": SMART_ROUTING_CODEX_SUBSCRIPTION_MODELS,
+    }
 )
 
 _HARNESS_FAMILY: dict[str, str] = {
@@ -234,7 +245,11 @@ def _pinned_brain_account_ids(
     :param prefixes: Catalog prefixes to strip before comparing ids.
     :returns: ``(provider, bare_id)`` pairs, comparison-spelled.
     """
-    models = [*MODEL_LISTS[family], *_CURRENT_GENERATION_MODELS.get(family, ())]
+    models = [
+        *MODEL_LISTS[family],
+        *_CURRENT_GENERATION_MODELS.get(family, ()),
+        *_SUBSCRIPTION_MODELS.get(family, ()),
+    ]
     if family == "pi":
         excluded = {_provider_and_bare(model, prefixes) for model in SMART_ROUTING_PI_EXCLUDED}
         return frozenset(

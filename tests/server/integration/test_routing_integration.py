@@ -2109,6 +2109,82 @@ async def test_a_pinned_brains_child_create_naming_a_model_outside_its_accounts_
     assert allowed.status_code == 201, allowed.text
 
 
+@pytest.mark.parametrize(
+    ("harness", "model", "expected_status"),
+    [
+        # The claude CLI's subscription rows, bare ids, inside the claude family.
+        ("claude-native", "opus", 201),
+        ("claude-native", "claude-fable-5-2[1m]", 201),
+        # A gateway-served Claude id stays outside a pinned child's accounts.
+        ("claude-native", "databricks-claude-sonnet-5", 400),
+    ],
+)
+async def test_a_pinned_brains_child_create_admits_its_own_subscription_ids(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+    model: str,
+    expected_status: int,
+) -> None:
+    _agent, parent, _conv_store = await _pinned_brain_parent(
+        client,
+        db_uri,
+        agent_name=f"pinned-brain-sub-{harness}-{expected_status}",
+        smart_routing_harness="pinned",
+    )
+    child_agent = await create_test_agent(
+        client,
+        name=f"pinned-brain-sub-child-{harness}-{expected_status}",
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": child_agent["id"],
+            "parent_session_id": parent.id,
+            "harness_override": harness,
+            "model_override": model,
+        },
+    )
+    assert created.status_code == expected_status, created.text
+    if expected_status != 201:
+        assert "outside the accounts" in created.text
+
+
+async def test_a_codex_pinned_brains_child_may_name_its_codex_subscription_id(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    parent_agent = await create_test_agent(
+        client,
+        name="pinned-brain-sub-codex-parent",
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "codex", "smart_routing_harness": "pinned"},
+        },
+    )
+    parent_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": parent_agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert parent_resp.status_code == 201, parent_resp.text
+    child_agent = await create_test_agent(
+        client,
+        name="pinned-brain-sub-codex-child",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": child_agent["id"],
+            "parent_session_id": parent_resp.json()["id"],
+            "harness_override": "codex-native",
+            "model_override": "gpt-6.1-sol",
+        },
+    )
+    assert created.status_code == 201, created.text
+
+
 async def test_a_substitution_at_child_creation_is_refused(
     client: httpx.AsyncClient,
     db_uri: str,
