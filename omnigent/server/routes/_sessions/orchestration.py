@@ -393,6 +393,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_cost_control_mode_override,
     _validated_harness_override,
     _validated_harness_override_executor_type,
+    _validated_spec_smart_routing_default,
     _validated_spec_smart_routing_harness,
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
@@ -12501,6 +12502,17 @@ def _spec_brain_routing(agent: Agent, agent_cache: AgentCache | None) -> str | N
         neither or cannot be loaded.
     :raises OmnigentError: ``invalid_input`` when the spec's value is invalid.
     """
+    spec = _routing_spec(agent, agent_cache)
+    return _validated_spec_smart_routing_harness(spec) if spec is not None else None
+
+
+def _routing_spec(agent: Agent, agent_cache: AgentCache | None) -> AgentSpec | None:
+    """Load the bound spec for a create-time Smart Routing opt-in.
+
+    :param agent: The bound agent row.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: The parsed spec, or ``None`` when it cannot be loaded.
+    """
     if agent_cache is None:
         return None
     try:
@@ -12512,7 +12524,32 @@ def _spec_brain_routing(agent: Agent, agent_cache: AgentCache | None) -> str | N
         # validation reports it.
         _logger.debug("create-time routing: agent %r failed to load", agent.name, exc_info=True)
         return None
-    return _validated_spec_smart_routing_harness(loaded.spec)
+    return loaded.spec
+
+
+def _spec_starts_routing_on(
+    body: SessionCreateInput,
+    agent: Agent,
+    agent_cache: AgentCache | None,
+) -> bool:
+    """Whether this create takes the spec's ``smart_routing_default: on``.
+
+    Only a top-level create the caller left routing unset on: an explicit
+    ``off`` for either routing switch wins, and a child follows its parent's
+    subagent-routing switch instead.
+
+    :param body: The validated create request.
+    :param agent: The bound agent row.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: ``True`` when ``cost_control_mode_override`` must become ``"on"``.
+    :raises OmnigentError: ``invalid_input`` when the spec's value is invalid.
+    """
+    if body.cost_control_mode_override is not None or body.subagent_routing_override == "off":
+        return False
+    if body.parent_session_id is not None or body.sub_agent_name is not None:
+        return False
+    spec = _routing_spec(agent, agent_cache)
+    return spec is not None and _validated_spec_smart_routing_default(spec)
 
 
 def _spec_pins_its_brain(
@@ -12959,6 +12996,11 @@ async def _create_session_from_existing_agent(
         permission_store=permission_store,
         conversation_store=conversation_store,
     )
+
+    # ``smart_routing_default: on``: the session starts as if the caller had
+    # turned Smart Routing on, so every create path below sees one request.
+    if await asyncio.to_thread(_spec_starts_routing_on, body, agent, agent_cache):
+        body = body.model_copy(update={"cost_control_mode_override": "on"})
 
     # Top-level Smart Routing: "auto" on a native wrapper agent means the client
     # picked Smart Routing with no bundle agent, and its ``agent_id`` is only a

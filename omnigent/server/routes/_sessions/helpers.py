@@ -2282,6 +2282,32 @@ def _validated_spec_smart_routing_harness(spec: AgentSpec) -> str | None:
     return AUTO_HARNESS_SENTINEL if value == AUTO_HARNESS_SENTINEL else PINNED_BRAIN_VALUE
 
 
+#: ``executor.config`` key making new top-level sessions of a spec start with
+#: Smart Routing on. ``on`` or ``off`` (the default).
+SMART_ROUTING_DEFAULT_CONFIG_KEY = "smart_routing_default"
+
+
+def _validated_spec_smart_routing_default(spec: AgentSpec) -> bool:
+    """
+    Read a spec's opt-in for starting its sessions with Smart Routing on.
+
+    :param spec: The bound agent's parsed spec.
+    :returns: ``True`` for ``smart_routing_default: on``; ``False`` when the
+        key is unset or ``off``.
+    :raises OmnigentError: ``invalid_input`` for any other value.
+    """
+    value = spec.executor.config.get(SMART_ROUTING_DEFAULT_CONFIG_KEY)
+    if value is None or value == "off":
+        return False
+    if value != "on":
+        raise OmnigentError(
+            f"invalid executor.config.{SMART_ROUTING_DEFAULT_CONFIG_KEY}: must be "
+            f"'on' or 'off', got {value!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return True
+
+
 def _utc_day(epoch_seconds: int) -> str:
     """
     Convert a Unix epoch timestamp to its UTC calendar day.
@@ -13305,6 +13331,7 @@ __all__ = [
     "_validated_cost_control_mode_override",
     "_validated_harness_override",
     "_validated_harness_override_executor_type",
+    "_validated_spec_smart_routing_default",
     "_validated_spec_smart_routing_harness",
     "_validated_subagent_routing_override",
     "_wait_for_managed_runner_tunnel",
