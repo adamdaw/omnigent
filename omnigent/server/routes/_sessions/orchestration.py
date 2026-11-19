@@ -12084,6 +12084,15 @@ def _external_router_usable(caps: Any = None) -> bool:  # type: ignore[explicit-
     return usable_external(backends_from_caps(caps)) is not None
 
 
+def _non_gateway_external_available() -> bool:
+    """Whether an opted-in external router can serve off-gateway harnesses."""
+    from omnigent.runtime._globals import _caps
+    from omnigent.server.routing_backend import backends_from_caps, usable_external
+
+    backends = backends_from_caps(_caps)
+    return backends.non_gateway and usable_external(backends) is not None
+
+
 def _judge_only_harness_note(harness: str, verdict: dict[str, Any]) -> str:
     """Explain on the chip why only the model was routed.
 
@@ -12238,7 +12247,7 @@ async def _reject_ungatewayed_model_routing(
         return
     # The built-in judge routes off the pane's own catalog, so it reaches an
     # ungatewayed harness the workspace router cannot. Check it before refusing.
-    if _oss_routing_available():
+    if _oss_routing_available() or _non_gateway_external_available():
         return
     host = await _routing_host_for_create(body, request, user_id)
     if not _ungatewayed_native_harnesses(host, (harness,)):
@@ -12622,7 +12631,7 @@ async def _resolve_native_smart_routing(
     # ends the create when the built-in judge is unavailable too — it names
     # models from each arm's own pre-launch catalog, which every arm can run.
     ungatewayed = _ungatewayed_native_harnesses(host, AUTO_NATIVE_ROUTING_HARNESSES)
-    if ungatewayed and not _oss_routing_available():
+    if ungatewayed and not (_oss_routing_available() or _non_gateway_external_available()):
         return None, None, None, _ungatewayed_auto_routing_error(ungatewayed)
     backed = not ungatewayed
     installed = _installed_native_harnesses(host)

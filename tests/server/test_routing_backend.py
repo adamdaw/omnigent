@@ -399,3 +399,24 @@ async def test_route_with_fallback_uses_the_judge_off_the_gateway() -> None:
 
 async def test_route_with_fallback_reports_an_unconfigured_deployment() -> None:
     assert await route_with_fallback(RoutingBackends(), "hi", _MENU, gateway_backed=True) is None
+
+
+def test_non_gateway_external_opt_in() -> None:
+    backends = RoutingBackends(external=_EXTERNAL, local=_LOCAL, non_gateway=True)
+    choice = select_router(backends, gateway_backed=False)
+    assert choice is not None
+    assert choice.client is _EXTERNAL
+
+
+@pytest.mark.parametrize("error", [None, RuntimeError("error"), TimeoutError("timeout")])
+async def test_non_gateway_external_failure_falls_back(error: Exception | None) -> None:
+    external = _Recording(None, error=error)
+    local = _Recording(_VERDICT)
+    call = await route_with_fallback(
+        RoutingBackends(external=external, local=local, non_gateway=True),
+        "hi",
+        _MENU,
+        gateway_backed=False,
+    )
+    assert call is not None and (call.result, call.source) == (_VERDICT, "oss-llm")
+    assert external.calls == local.calls == 1

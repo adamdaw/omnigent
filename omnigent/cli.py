@@ -456,7 +456,11 @@ def _build_routing_backends(
         external = _build_external_routing_client(routing_cfg, settings, cfg)
     elif not isinstance(routing_cfg, dict):
         external = _build_default_databricks_routing_client(cfg, settings)
-    return RoutingBackends(external=external, local=_build_local_llm_routing_client(server_llm))
+    return RoutingBackends(
+        external=external,
+        local=_build_local_llm_routing_client(server_llm),
+        non_gateway=provider == "external" and routing_cfg.get("non_gateway") is True,
+    )
 
 
 def _server_uvicorn_log_config(

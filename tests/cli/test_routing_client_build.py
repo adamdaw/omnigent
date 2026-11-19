@@ -122,3 +122,17 @@ def test_an_unusable_config_leaves_routing_off() -> None:
             {"routing": {"provider": "judge"}}, None, RoutingSettings()
         )
     assert (backends.external, backends.local) == (None, None)
+
+
+@pytest.mark.parametrize(("value", "expected"), [(True, True), (False, False), ("true", False)])
+def test_external_non_gateway_requires_explicit_boolean(value: Any, expected: bool) -> None:
+    cfg = {
+        "routing": {
+            "provider": "external",
+            "base_url": "https://router.invalid",
+            "router_name": "winnow",
+            "non_gateway": value,
+        }
+    }
+    backends = _build_routing_backends(cfg, None, RoutingSettings())
+    assert backends.non_gateway is expected

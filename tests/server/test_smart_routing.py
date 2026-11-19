@@ -3732,3 +3732,69 @@ async def test_a_runner_rebind_invalidates_the_routing_catalog() -> None:
     await fetch_runner_models("conv_overlay", client)
 
     assert client.get.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_opted_in_external_receives_off_gateway_session_catalog() -> None:
+    external = FakeRoutingClient(
+        RoutingResult(model="claude-sonnet-4-6", rationale="external", harness="claude-native")
+    )
+    local = FakeRoutingClient(
+        RoutingResult(model="claude-opus-4-8", rationale="local", harness="claude-native")
+    )
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=local, non_gateway=True),
+    )
+    catalog = {"claude-native": ["claude-sonnet-4-6", "claude-opus-4-8"]}
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, verdict, error = await route_session_harness(
+            "hello",
+            harness_candidates=("claude-native",),
+            catalog=catalog,
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert (harness, model, error) == ("claude-native", "claude-sonnet-4-6", None)
+    assert verdict is not None and verdict["router_source"] == "databricks-aigw"
+    assert external.offered == [catalog]
+    assert not local.offered
+
+
+@pytest.mark.asyncio
+async def test_winnow_rejects_unoffered_pick_and_falls_back() -> None:
+    import httpx
+
+    from omnigent.server.routing_backend import route_with_fallback
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200, json={"route_selection": [{"route_option": {"model": "hallucinated"}}]}
+        )
+
+    external = ExternalRoutingClient(base_url="https://router.invalid", router_name="winnow")
+    local = FakeRoutingClient(RoutingResult(model="pollux/qwen", rationale="fallback"))
+    catalog = {
+        "pi": ["pollux/qwen"],
+        "claude-native": ["claude-sonnet-4-6"],
+        "codex-native": ["gpt-5-5"],
+    }
+    with _patch_httpx(httpx.MockTransport(handler)):
+        call = await route_with_fallback(
+            RoutingBackends(external=external, local=local, non_gateway=True),
+            "hello",
+            catalog,
+            gateway_backed=False,
+        )
+    assert call is not None and call.source == "oss-llm"
+    assert call.result is not None and call.result.model == "pollux/qwen"
+    assert {option["model"] for option in captured["route_options"]} == {
+        "pollux/qwen",
+        "claude-sonnet-4-6",
+        "gpt-5-5",
+    }
+    assert local.offered == [catalog]

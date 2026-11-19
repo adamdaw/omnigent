@@ -43,10 +43,12 @@ class RoutingBackends:
 
     :param external: The external ``routes:select`` client, or ``None``.
     :param local: The built-in judge, or ``None``.
+    :param non_gateway: Explicitly allow the external router for off-gateway inference.
     """
 
     external: RoutingClient | None = None
     local: RoutingClient | None = None
+    non_gateway: bool = False
 
     def any(self) -> RoutingClient | None:
         """The client to use when nothing is known about gateway backing.
@@ -98,13 +100,14 @@ def select_router(
 
     :param backends: The deployment's configured clients.
     :param gateway_backed: Whether EVERY harness family involved in this call
-        resolves AI-Gateway-backed inference. False takes the external client
-        out of play — its picks are gateway catalog ids the pane cannot reach.
+        resolves AI-Gateway-backed inference. False excludes the external client
+        unless explicitly opted in: the default workspace router returns gateway
+        catalog ids the pane cannot reach.
     :returns: The chosen client plus its source, or ``None`` when neither
         backend can serve (today's "routing unavailable").
     """
     external = usable_external(backends)
-    if gateway_backed and external is not None:
+    if (gateway_backed or backends.non_gateway) and external is not None:
         return RouterChoice(client=external, source="databricks-aigw")
     if backends.local is not None:
         return RouterChoice(client=backends.local, source="oss-llm")
