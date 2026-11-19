@@ -8000,8 +8000,8 @@ def test_native_relay_builtin_set_matches_toolmanager_gating(
     assert relayed & spawn_writes == expected_writes
     # Model awareness rides the dispatch grant: relayed iff send is.
     assert ("sys_list_models" in relayed) == ("sys_session_send" in expected_writes)
-    # Advise-models also requires a routing client; default caps have none.
-    assert "sys_advise_models" not in relayed
+    # Advice is handled by the server and requires the spawn grant.
+    assert ("sys_advise_models" in relayed) == (opt_in == "spawn")
 
     # OS tools ride a separate unconditional relay path (overriding the
     # bridge's static versions), so they must never be in the builtin set —

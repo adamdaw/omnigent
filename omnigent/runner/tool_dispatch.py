@@ -410,7 +410,7 @@ _LIST_MODELS_TOOLS = frozenset({"sys_list_models"})
 _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
 
 # Priority 5f.3: sys_advise_models — server-side via MCP intercept;
-# included in the tool surface only when smart routing is enabled.
+# advertised to spawn-enabled agents.
 _ADVISE_MODELS_TOOLS = frozenset({"sys_advise_models"})
 
 # Priority 5h: Task lifecycle tools — runner-local sys_cancel_task.

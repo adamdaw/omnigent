@@ -13,7 +13,6 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
-from omnigent.runtime import get_caps
 from omnigent.spec import AgentSpec
 from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
@@ -498,19 +497,13 @@ class ToolManager:
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)
-        # Advise-models is capability-gated: expose it only when some router can
-        # answer. Hiding the tool prevents agents from probing router_on via a
-        # no-op call when routing is disabled.
-        from omnigent.server.routing_backend import routing_available
-
-        if routing_available(get_caps()):
-            self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
-
         # create: spawning OUTSIDE the declared list (existing agents
         # by id, or custom bundles via config_path) requires the
         # explicit ``spawn: true`` grant — declaring tools.agents
         # alone only permits the specified sub-agent types.
         if self._spec.spawn:
+            # The server handles advice and reports when routing is unavailable.
+            self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
             self._tools[SysSessionCreateTool.name()] = SysSessionCreateTool()
 
     def _register_session_tools(self) -> None:
