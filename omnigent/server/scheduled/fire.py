@@ -2044,6 +2044,13 @@ async def _create_session_resources(
                 git_branch=worktree.branch if worktree else None,
             )
         else:
+            run_agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
+            if run_agent is not None and await asyncio.to_thread(
+                _agent_pins_its_brain, run_agent, deps.agent_cache
+            ):
+                from omnigent.runner.subagent_routing import PINNED_BRAIN_LABEL_KEY
+
+                labels = {**labels, PINNED_BRAIN_LABEL_KEY: "1"}
             conv = await asyncio.to_thread(
                 deps.conversation_store.create_conversation,
                 agent_id=task.agent_id,
