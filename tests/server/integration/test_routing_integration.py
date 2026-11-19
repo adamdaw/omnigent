@@ -1787,9 +1787,13 @@ async def test_a_fork_of_a_worker_is_no_longer_authorized(
 OUTSIDE_PROVIDER_MODEL = "openrouter/mistral-large"
 OUTSIDE_CLAUDE_MODEL = "system.ai.claude-foo-9"
 INSIDE_PI_MODEL = "system.ai.claude-sonnet-5"
+# Another provider serving the same bare model as an approved id.
+OUTSIDE_SAME_BARE_MODEL = "databricks-claude-sonnet-5"
 
 
-def _multi_provider_catalog() -> dict[str, list[Any]]:  # type: ignore[explicit-any]
+def _multi_provider_catalog(
+    extra_pi_models: tuple[str, ...] = (),
+) -> dict[str, list[Any]]:  # type: ignore[explicit-any]
     """A runner catalog whose workers reach providers outside the accounts."""
     from omnigent.server.smart_routing import _RunnerModel
 
@@ -1804,7 +1808,12 @@ def _multi_provider_catalog() -> dict[str, list[Any]]:  # type: ignore[explicit-
     return {
         "claude_code": [row(INSIDE_PI_MODEL), row(OUTSIDE_CLAUDE_MODEL)],
         "codex": [row(GPT_MODEL)],
-        "pi": [row(INSIDE_PI_MODEL), row(OUTSIDE_PROVIDER_MODEL), row(GPT_MODEL)],
+        "pi": [
+            row(INSIDE_PI_MODEL),
+            row(OUTSIDE_PROVIDER_MODEL),
+            row(GPT_MODEL),
+            *(row(model) for model in extra_pi_models),
+        ],
     }
 
 
@@ -1852,6 +1861,95 @@ async def test_a_pinned_brains_child_is_never_offered_or_routed_outside_its_acco
     assert OUTSIDE_PROVIDER_MODEL not in offered
     assert OUTSIDE_CLAUDE_MODEL not in offered
     # Its pick was refused, so nothing outside the accounts was applied.
+    refreshed = conv_store.get_conversation(child_conv.id)
+    assert refreshed is not None
+    assert refreshed.model_override is None
+    assert refreshed.harness_override != "pi"
+
+
+async def test_a_pinned_brains_child_is_never_routed_to_another_providers_bare_id(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Another provider's id with an approved bare model is not offered, picked, or created."""
+    _agent, parent, conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-same-bare", smart_routing_harness="pinned"
+    )
+    child = await _create_child(
+        client, parent.id, agent_name="pinned-brain-same-bare-codex", harness="codex"
+    )
+    assert child.status_code == 201, child.text
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=OUTSIDE_SAME_BARE_MODEL, rationale="cheapest", harness="pi")
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "review the diff"}]},
+    )
+    catalog = _multi_provider_catalog(extra_pi_models=(OUTSIDE_SAME_BARE_MODEL,))
+    with (
+        patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)),
+        patch(
+            "omnigent.server.smart_routing._fetch_runner_catalog",
+            new=AsyncMock(return_value=catalog),
+        ),
+    ):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child_conv.id, child_conv, body, conv_store, runner_client
+            )
+
+    assert routing_client.offered, "the router must be consulted for the boundary to mean anything"
+    offered = {
+        model for models in routing_client.offered for ids in models.values() for model in ids
+    }
+    assert INSIDE_PI_MODEL in offered
+    assert OUTSIDE_SAME_BARE_MODEL not in offered
+    refreshed = conv_store.get_conversation(child_conv.id)
+    assert refreshed is not None
+    assert refreshed.model_override != OUTSIDE_SAME_BARE_MODEL
+    assert refreshed.harness_override != "pi"
+
+
+async def test_a_pinned_brains_child_is_not_routed_by_a_judge_on_a_public_host(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A pinned brain's child with a built-in judge on a public host is not routed at all."""
+    _agent, parent, conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-public-judge", smart_routing_harness="pinned"
+    )
+    child = await _create_child(
+        client, parent.id, agent_name="pinned-brain-public-judge-codex", harness="codex"
+    )
+    assert child.status_code == 201, child.text
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=INSIDE_PI_MODEL, rationale="cheapest", harness="pi"),
+        endpoint_url="https://api.example.com/v1",
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "review the diff"}]},
+    )
+    with (
+        patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)),
+        patch(
+            "omnigent.server.smart_routing._fetch_runner_catalog",
+            new=AsyncMock(return_value=_multi_provider_catalog()),
+        ),
+    ):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child_conv.id, child_conv, body, conv_store, runner_client
+            )
+
+    assert routing_client.offered == [], "a public judge must not be consulted for a pinned child"
     refreshed = conv_store.get_conversation(child_conv.id)
     assert refreshed is not None
     assert refreshed.model_override is None

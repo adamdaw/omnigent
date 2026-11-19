@@ -26,6 +26,7 @@ from omnigent.server.smart_routing import (
     fetch_runner_models,
     harness_bars_model,
     infer_models,
+    judge_endpoint_is_local,
     pinned_brain_account_allows,
     route_session_harness,
     route_turn,
@@ -3749,6 +3750,9 @@ async def test_a_runner_rebind_invalidates_the_routing_catalog() -> None:
         ("pi", "system.ai.claude-haiku-4-5", False),
         # Another provider's id, even under a harness in the accounts.
         ("pi", "openrouter/mistral-large", False),
+        # Another provider serving the same bare model as an approved id.
+        ("pi", "databricks-claude-sonnet-5", False),
+        ("claude-sdk", "databricks-claude-opus-4-8", False),
         ("claude-sdk", "system.ai.claude-foo-9", False),
         # A model of the wrong family for the harness.
         ("claude-sdk", "system.ai.gpt-5-5", False),
@@ -3764,3 +3768,25 @@ def test_pinned_brain_account_boundary(
     harness: str | None, model: str | None, allowed: bool
 ) -> None:
     assert pinned_brain_account_allows(harness, model) is allowed
+
+
+@pytest.mark.parametrize(
+    ("url", "local"),
+    [
+        ("http://localhost:8080/v1", True),
+        ("http://127.0.0.1:11434", True),
+        ("http://[::1]:8080", True),
+        ("http://judge.example-tailnet.ts.net:8080", True),
+        ("http://100.100.20.30:8080", True),
+        # Public hosts, including a bare public address and an unlisted CGNAT-adjacent one.
+        ("https://api.example.com/v1", False),
+        ("https://203.0.113.7/v1", False),
+        ("http://100.128.0.1:8080", False),
+        ("https://localhost.example.com", False),
+        ("", False),
+        (None, False),
+        ("not a url", False),
+    ],
+)
+def test_judge_endpoint_must_be_local_or_tailnet(url: str | None, local: bool) -> None:
+    assert judge_endpoint_is_local(url) is local

@@ -392,6 +392,73 @@ async def test_a_pinned_brains_spawn_is_offered_only_in_account_models() -> None
     assert decision.model is None
 
 
+async def test_a_pinned_brains_spawn_is_not_offered_another_providers_bare_id() -> None:
+    """A databricks id with the same bare model as an approved one is outside the accounts."""
+    outside = "databricks-claude-sonnet-5"
+    approved = "system.ai.claude-sonnet-5"
+    session_id = "pinned-brain-provider-identity"
+    remember_session_routing_class(
+        session_id, SessionRoutingClass(routing_enabled=True, pinned_brain=True)
+    )
+    try:
+        client = FakeRoutingClient(
+            RoutingResult(model=outside, rationale="cheapest", harness="claude-native")
+        )
+        decision = await resolve_subagent_route(
+            session_id,
+            _request(harness="claude-native", prompt="review the diff"),
+            caps=FakeCaps(routing_client=client),
+            catalog={"self": [approved, outside]},
+        )
+    finally:
+        forget_session_routing_class(session_id)
+    offered = {m for call in client.offered for ms in call.values() for m in ms}
+    assert approved in offered
+    assert outside not in offered
+    # The outside pick is never applied: it is substituted with an approved id.
+    assert decision.model == approved
+
+
+async def test_a_pinned_brains_spawn_is_refused_when_the_judge_is_not_local() -> None:
+    """A pinned brain's spawn never reaches a judge on a public host."""
+    session_id = "pinned-brain-public-judge"
+    remember_session_routing_class(
+        session_id, SessionRoutingClass(routing_enabled=True, pinned_brain=True)
+    )
+    try:
+        client = FakeRoutingClient(
+            RoutingResult(model=CLAUDE_MODEL, rationale="cheapest", harness="claude-native"),
+            endpoint_url="https://api.example.com/v1",
+        )
+        decision = await resolve_subagent_route(
+            session_id,
+            _request(harness="claude-native", prompt="review the diff"),
+            caps=FakeCaps(routing_client=client),
+            catalog={"self": [CLAUDE_MODEL]},
+        )
+    finally:
+        forget_session_routing_class(session_id)
+    assert client.calls == []
+    assert decision.action == "allow"
+    assert "built-in judge does not answer on localhost or a tailnet host" in decision.rationale
+
+
+async def test_a_public_judge_still_routes_a_spawn_that_is_not_pinned() -> None:
+    """The endpoint check binds pinned brains only; other spawns keep their judge."""
+    client = FakeRoutingClient(
+        RoutingResult(model=CLAUDE_MODEL, rationale="cheapest", harness="claude-native"),
+        endpoint_url="https://api.example.com/v1",
+    )
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="claude-native", prompt="review the diff"),
+        caps=FakeCaps(routing_client=client),
+        catalog={"self": [CLAUDE_MODEL]},
+    )
+    assert len(client.calls) == 1
+    assert decision.model == CLAUDE_MODEL
+
+
 async def test_the_router_is_called_even_when_the_spawn_names_a_model() -> None:
     """Regression: a ``requested_model`` used to skip ``client.route`` entirely,
     so every rationale read "it is a routable arm" and no rule trace existed."""

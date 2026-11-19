@@ -227,6 +227,25 @@ def gateway_backs_all(
     return not not_gateway_backed(reported_gateway_inference(host), harnesses)
 
 
+def pinned_brain_router_refusal(backends: RoutingBackends) -> str | None:
+    """Why a pinned brain's child may not be routed by *backends*, or ``None``.
+
+    An external router is a hosted service outside the accounts. The built-in
+    judge is allowed only when its endpoint is local or on the tailnet.
+
+    :param backends: The deployment's routing backends.
+    :returns: A reason clause for the refusal, or ``None`` when routing may proceed.
+    """
+    from omnigent.server.smart_routing import judge_endpoint_is_local
+
+    if backends.external is not None:
+        return "an external router is configured"
+    judge_url = getattr(backends.local, "endpoint_url", None)
+    if not judge_endpoint_is_local(judge_url):
+        return "the built-in judge does not answer on localhost or a tailnet host"
+    return None
+
+
 def backends_from_caps(caps: Any) -> RoutingBackends:  # type: ignore[explicit-any]  # RuntimeCaps-shaped
     """Read a deployment's routing backends off its caps.
 

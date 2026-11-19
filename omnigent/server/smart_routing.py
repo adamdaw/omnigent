@@ -13,6 +13,7 @@ swap in a different implementation via ``RuntimeCaps``.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import re
@@ -20,6 +21,7 @@ import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
+from urllib.parse import urlsplit
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.models.model_fallbacks import (
@@ -200,23 +202,46 @@ def catalog_models_for_harness(
     return None
 
 
-def _pinned_brain_account_ids(family: str, prefixes: Sequence[str] | None) -> frozenset[str]:
-    """The model ids a pinned brain's children may run on, for one family.
+def _provider_and_bare(model: str, prefixes: Sequence[str] | None = None) -> tuple[str, str]:
+    """Split a catalog id into its provider and its comparison-spelled bare id.
+
+    The provider is the catalog prefix that was stripped (``"system.ai"``,
+    ``"databricks"``), or ``""`` for an id that carries none. Kept as part of
+    the identity so two providers serving the same bare model never compare
+    equal.
+
+    :param model: A catalog model id, e.g. ``"databricks-claude-sonnet-5"``.
+    :param prefixes: Catalog prefixes to try, or ``None`` for this deployment's.
+    :returns: ``(provider, bare_id)``.
+    """
+    stripped = strip_catalog_prefix(model, _configured_prefixes(prefixes))
+    provider = model[: len(model) - len(stripped)].rstrip(".-_")
+    return provider, _bare_id(model, prefixes)
+
+
+def _pinned_brain_account_ids(
+    family: str, prefixes: Sequence[str] | None
+) -> frozenset[tuple[str, str]]:
+    """The (provider, model) pairs a pinned brain's children may run on, for one family.
 
     The owned static tables: the family's ladder and its current-generation
-    arms. Pi's gateway rejects some of its ladder, so those come out.
+    arms. Pi's gateway rejects some of its ladder, so those come out. A bare
+    id in these tables has no provider and so approves nothing outside the
+    tables' own spelling.
 
     :param family: ``"claude"``, ``"gpt"`` or ``"pi"``.
     :param prefixes: Catalog prefixes to strip before comparing ids.
-    :returns: Bare, comparison-spelled ids.
+    :returns: ``(provider, bare_id)`` pairs, comparison-spelled.
     """
-    ids = {
-        _bare_id(model, prefixes)
-        for model in (*MODEL_LISTS[family], *_CURRENT_GENERATION_MODELS.get(family, ()))
-    }
+    models = [*MODEL_LISTS[family], *_CURRENT_GENERATION_MODELS.get(family, ())]
     if family == "pi":
-        ids -= {_bare_id(model, prefixes) for model in SMART_ROUTING_PI_EXCLUDED}
-    return frozenset(ids)
+        excluded = {_provider_and_bare(model, prefixes) for model in SMART_ROUTING_PI_EXCLUDED}
+        return frozenset(
+            pair
+            for pair in (_provider_and_bare(model, prefixes) for model in models)
+            if pair not in excluded
+        )
+    return frozenset(_provider_and_bare(model, prefixes) for model in models)
 
 
 def pinned_brain_account_allows(harness: str | None, model: str | None = None) -> bool:
@@ -241,7 +266,37 @@ def pinned_brain_account_allows(harness: str | None, model: str | None = None) -
     if model is None:
         return True
     prefixes = routing_settings().model_prefixes
-    return _bare_id(model, prefixes) in _pinned_brain_account_ids(family, prefixes)
+    return _provider_and_bare(model, prefixes) in _pinned_brain_account_ids(family, prefixes)
+
+
+#: The tailnet's CGNAT address block (Tailscale assigns node IPs from it).
+_TAILNET_ADDRESSES = ipaddress.ip_network("100.64.0.0/10")
+
+
+def judge_endpoint_is_local(url: str | None) -> bool:
+    """Whether a judge endpoint is localhost, loopback, or a tailnet host.
+
+    Fails closed: a missing or unparseable URL, or any other host, is not local.
+
+    :param url: The judge endpoint's base URL, or ``None`` when it has none.
+    :returns: ``True`` when the host is localhost, a loopback or tailnet address,
+        or a ``*.ts.net`` name.
+    """
+    if not url:
+        return False
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host == "localhost" or host.endswith((".localhost", ".ts.net")):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address in _TAILNET_ADDRESSES
 
 
 def _within_account_boundary(harness: str, models: Iterable[str], *, bound: bool) -> list[str]:
@@ -662,8 +717,10 @@ class LLMRoutingClient:
     on the same budget the external router gets.
     """
 
-    def __init__(self, llm_client: Any) -> None:
+    def __init__(self, llm_client: Any, *, endpoint_url: str | None = None) -> None:
         self._llm = llm_client
+        # Where the judge's LLM call goes; checked before a pinned brain's child routes.
+        self.endpoint_url = endpoint_url
         # Reason the most recent route() returned None; see RoutingClient.
         self.last_error: str | None = None
 
@@ -2268,19 +2325,14 @@ async def route_session_harness(
 
     from omnigent.server.routing_backend import (
         backends_from_caps,
+        pinned_brain_router_refusal,
         route_with_fallback,
         select_router,
     )
 
     backends = backends_from_caps(_caps)
-    if account_bound and backends.external is not None:
-        # The external router is a hosted service outside the session's accounts.
-        return (
-            None,
-            None,
-            None,
-            "Routing for a pinned brain's child is refused: an external router is configured.",
-        )
+    if account_bound and (refusal := pinned_brain_router_refusal(backends)) is not None:
+        return None, None, None, f"Routing for a pinned brain's child is refused: {refusal}."
     if select_router(backends, gateway_backed=gateway_backed) is None:
         return None, None, None, "Smart routing is not configured on this server."
 

@@ -825,6 +825,7 @@ async def _decide(
 
     from omnigent.server.routing_backend import (
         backends_from_caps,
+        pinned_brain_router_refusal,
         route_with_fallback,
         select_router,
     )
@@ -835,8 +836,8 @@ async def _decide(
     account_bound = session_routing_class(session_id).pinned_brain
 
     backends = backends_from_caps(caps)
-    if account_bound and backends.external is not None:
-        return _unavailable_decision("an external router is refused for a pinned brain's spawns")
+    if account_bound and (refusal := pinned_brain_router_refusal(backends)) is not None:
+        return _unavailable_decision(f"refused for a pinned brain's spawns: {refusal}")
     if select_router(backends, gateway_backed=gateway_backed) is None:
         return _unavailable_decision("no routing client configured")
 

@@ -1194,6 +1194,10 @@ class CapturingRunnerClient:
 # router double has one definition instead of one per file.
 
 
+#: A judge endpoint on the tailnet, which a pinned brain's child may use.
+TAILNET_JUDGE_URL = "http://judge.example-tailnet.ts.net:8080"
+
+
 class FakeRoutingClient:
     """Routing-client double: canned verdict, recorded offers, optional error.
 
@@ -1202,6 +1206,8 @@ class FakeRoutingClient:
     :param error: Raised from :meth:`route` instead of returning, to
         exercise the fail-open paths.
     :param last_error: Seeds the protocol's ``last_error`` reason field.
+    :param endpoint_url: The judge endpoint a pinned brain's child is checked
+        against. Defaults to a tailnet host.
     :ivar calls: ``(message, offered_models)`` per :meth:`route` call.
     :ivar offered: The ``available_models`` mapping per call.
     """
@@ -1212,10 +1218,12 @@ class FakeRoutingClient:
         *,
         error: Exception | None = None,
         last_error: str | None = None,
+        endpoint_url: str | None = TAILNET_JUDGE_URL,
     ) -> None:
         self._result = result
         self._error = error
         self.last_error = last_error
+        self.endpoint_url = endpoint_url
         self.calls: list[tuple[str, dict[str, list[str]]]] = []
         self.offered: list[dict[str, list[str]]] = []
 

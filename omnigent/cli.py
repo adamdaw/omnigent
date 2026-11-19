@@ -416,7 +416,8 @@ def _build_local_llm_routing_client(
         return None
     from omnigent.server.smart_routing import LLMRoutingClient
 
-    return LLMRoutingClient(policy_client)
+    endpoint_url = conn.get("base_url") if conn else None
+    return LLMRoutingClient(policy_client, endpoint_url=endpoint_url)
 
 
 def _build_routing_backends(
