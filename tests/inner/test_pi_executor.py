@@ -4773,6 +4773,72 @@ def test_non_gateway_path_does_not_inject_default_model() -> None:
     assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
 
+def _write_two_endpoint_pi_dir(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Point the executor at a Pi dir whose default provider ``primary`` is down.
+
+    Both providers serve ``qwen``; only ``primary``'s endpoint fails the probe.
+    """
+    from omnigent.models import model_catalog
+
+    root.mkdir()
+    providers = {
+        name: {"baseUrl": url, "apiKey": "unused", "models": [{"id": "qwen"}]}
+        for name, url in (
+            ("primary", "http://primary.example.com:8080/v1"),
+            ("fallback", "http://fallback.example.com:8080/v1"),
+        )
+    }
+    (root / "models.json").write_text(json.dumps({"providers": providers}))
+    (root / "settings.json").write_text(
+        json.dumps({"defaultProvider": "primary", "defaultModel": "qwen"})
+    )
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(root))
+    monkeypatch.setattr(
+        model_catalog,
+        "_pi_endpoint_up",
+        lambda base_url, _deadline=None: "primary" not in base_url,
+    )
+    model_catalog.clear_model_catalog_cache()
+
+
+@pytest.mark.usefixtures("pi_launch_model_fallback")
+@pytest.mark.parametrize(
+    ("requested", "pinned_fallback_env", "expected"),
+    [
+        (None, None, "fallback/qwen"),
+        ("primary/qwen", None, "primary/qwen"),
+        ("primary/qwen", "1", "fallback/qwen"),
+        # Only exactly "1" opts in; other non-empty values leave the pin alone.
+        ("primary/qwen", "true", "primary/qwen"),
+        ("primary/qwen", "yes", "primary/qwen"),
+        ("primary/qwen", "0", "primary/qwen"),
+        ("primary/qwen", " 1", "primary/qwen"),
+    ],
+)
+def test_non_gateway_launch_moves_off_unreachable_pi_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested: str | None,
+    pinned_fallback_env: str | None,
+    expected: str,
+) -> None:
+    """
+    Pi's own default provider is down: an unpinned launch takes the same model
+    on a reachable provider instead of hanging; an explicit pin moves only when
+    the host sets ``OMNIGENT_PI_PINNED_MODEL_FALLBACK=1``. This test opts out of
+    the conftest guard, so it covers the executor's real call into the resolver.
+    """
+    _write_two_endpoint_pi_dir(monkeypatch, tmp_path / "pi")
+    if pinned_fallback_env is None:
+        monkeypatch.delenv("OMNIGENT_PI_PINNED_MODEL_FALLBACK", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_PI_PINNED_MODEL_FALLBACK", pinned_fallback_env)
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor()
+
+    assert _run(executor._resolve_model(ExecutorConfig(model=requested))) == expected
+
+
 def test_models_json_lists_only_live_gateway_models() -> None:
     """Pi's picker mirrors live workspace models and their wire surfaces."""
     catalog_models = (

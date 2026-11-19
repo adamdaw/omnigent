@@ -12,6 +12,7 @@ Databricks credential mint is stubbed with the real
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Iterator
@@ -3460,6 +3461,162 @@ def test_pi_subscription_worker_row_lists_own_models(
     listing = list_models_for_worker(_worker_spec("pi"), "pi")
 
     assert _listed_ids(listing)[:2] == ["primary/small", "primary/large"]
+
+
+@pytest.mark.usefixtures("pi_launch_model_fallback")
+def test_pi_unpinned_launch_moves_off_unreachable_default_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Pi's default provider is down, so the launch takes the same id elsewhere.
+
+    ``enabledModels`` names only the default; the fallback must still count.
+    """
+    root = tmp_path / "pi"
+    _write_pi_agent_dir(
+        monkeypatch,
+        root,
+        {
+            "defaultProvider": "primary",
+            "defaultModel": "small",
+            "enabledModels": ["primary/small"],
+        },
+    )
+    probed = _pi_endpoints(monkeypatch, down={_PI_PRIMARY_URL})
+
+    with caplog.at_level(logging.INFO, logger=model_catalog.__name__):
+        launched = model_catalog.pi_own_login_launch_model(None, root, substitute_pinned=False)
+
+    assert launched == "fallback/small"
+    assert sorted(probed) == sorted([_PI_PRIMARY_URL, _PI_FALLBACK_URL])
+    assert "launching fallback/small instead of primary/small" in caplog.text
+
+
+@pytest.mark.usefixtures("pi_launch_model_fallback")
+def test_pi_unpinned_launch_keeps_reachable_default_and_reuses_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A healthy default keeps Pi's own choice; a second launch probes nothing."""
+    root = tmp_path / "pi"
+    _write_pi_agent_dir(monkeypatch, root, {"defaultProvider": "primary", "defaultModel": "small"})
+    probed = _pi_endpoints(monkeypatch, down=set())
+
+    assert model_catalog.pi_own_login_launch_model(None, root, substitute_pinned=False) is None
+    probes_after_first = len(probed)
+    assert model_catalog.pi_own_login_launch_model(None, root, substitute_pinned=False) is None
+
+    assert len(probed) == probes_after_first == 2
+
+
+@pytest.mark.usefixtures("pi_launch_model_fallback")
+@pytest.mark.parametrize(
+    ("substitute_pinned", "expected", "probes"),
+    [(False, "primary/small", 0), (True, "fallback/small", 2)],
+)
+def test_pi_pinned_launch_moves_only_when_opted_in(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    substitute_pinned: bool,
+    expected: str,
+    probes: int,
+) -> None:
+    """An explicit pin stays explicit (unprobed) unless the host opts in."""
+    root = tmp_path / "pi"
+    _write_pi_agent_dir(
+        monkeypatch, root, {"defaultProvider": "fallback", "defaultModel": "large"}
+    )
+    probed = _pi_endpoints(monkeypatch, down={_PI_PRIMARY_URL})
+
+    launched = model_catalog.pi_own_login_launch_model(
+        "primary/small", root, substitute_pinned=substitute_pinned
+    )
+
+    assert launched == expected
+    assert len(probed) == probes
+
+
+@pytest.mark.usefixtures("pi_launch_model_fallback")
+def test_pi_launch_fallback_follows_models_json_order_not_login_cache_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Logged-in cache order (``second``, ``first``) must not beat ``models.json`` order."""
+    root = tmp_path / "pi"
+    _write_pi_providers(
+        monkeypatch,
+        root,
+        {
+            name: {"baseUrl": f"http://{name}.example.com:8080/v1", "models": [{"id": "small"}]}
+            for name in ("primary", "first", "second")
+        },
+        {"defaultProvider": "primary", "defaultModel": "small"},
+    )
+    cached = {"second": {"models": [{"id": "small"}]}, "first": {"models": [{"id": "small"}]}}
+    (root / "models-store.json").write_text(json.dumps(cached))
+    (root / "auth.json").write_text(json.dumps({"second": {}, "first": {}}))
+    _pi_endpoints(monkeypatch, down={"http://primary.example.com:8080/v1"})
+
+    launched = model_catalog.pi_own_login_launch_model(None, root, substitute_pinned=False)
+
+    assert launched == "first/small"
+
+
+@pytest.mark.usefixtures("pi_launch_model_fallback")
+def test_pi_launch_with_no_reachable_provider_keeps_model_and_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing reachable: launch as before, but say so loudly."""
+    root = tmp_path / "pi"
+    _write_pi_agent_dir(monkeypatch, root, {"defaultProvider": "primary", "defaultModel": "small"})
+    _pi_endpoints(monkeypatch, down={_PI_PRIMARY_URL, _PI_FALLBACK_URL})
+
+    with caplog.at_level(logging.WARNING, logger=model_catalog.__name__):
+        launched = model_catalog.pi_own_login_launch_model(None, root, substitute_pinned=True)
+
+    assert launched is None
+    assert "no other provider serving 'small' answers" in caplog.text
+
+
+@pytest.mark.usefixtures("pi_launch_model_fallback")
+@pytest.mark.parametrize(
+    ("providers", "requested"),
+    [
+        # A single endpoint has nothing to fall back to.
+        ({"primary": {"baseUrl": _PI_PRIMARY_URL, "models": [{"id": "small"}]}}, None),
+        # A provider without a baseUrl cannot be probed.
+        (
+            {
+                "primary": {"baseUrl": _PI_PRIMARY_URL, "models": [{"id": "small"}]},
+                "fallback": {"baseUrl": _PI_FALLBACK_URL, "models": [{"id": "small"}]},
+                "keyed": {"models": [{"id": "small"}]},
+            },
+            "keyed/small",
+        ),
+        # No other provider serves the id.
+        (
+            {
+                "primary": {"baseUrl": _PI_PRIMARY_URL, "models": [{"id": "small"}]},
+                "fallback": {"baseUrl": _PI_FALLBACK_URL, "models": [{"id": "large"}]},
+            },
+            "primary/small",
+        ),
+    ],
+)
+def test_pi_launch_model_skips_probe_without_a_possible_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    providers: dict[str, dict[str, object]],
+    requested: str | None,
+) -> None:
+    """Probes run only when a substitute could exist."""
+    root = tmp_path / "pi"
+    _write_pi_providers(
+        monkeypatch, root, providers, {"defaultProvider": "primary", "defaultModel": "small"}
+    )
+    probed = _pi_endpoints(monkeypatch, down={_PI_PRIMARY_URL, _PI_FALLBACK_URL})
+
+    launched = model_catalog.pi_own_login_launch_model(requested, root, substitute_pinned=True)
+
+    assert launched == requested
+    assert probed == []
 
 
 def test_pi_endpoint_probe_counts_any_http_response_as_up() -> None:
