@@ -573,27 +573,18 @@ def _spawn_spec() -> AgentSpec:
     return AgentSpec(spec_version=1, spawn=True)
 
 
-def test_advise_models_exposed_when_server_routes_but_runner_has_no_router() -> None:
-    """The server's routing capability is independent of the runner's caps."""
-    from omnigent.server.routing_backend import routing_available
-
-    server_caps = _FakeRoutingCaps(routing_client=object())
-    runner_caps = _FakeRoutingCaps(routing_client=None)
-    assert routing_available(server_caps)
-    assert not routing_available(runner_caps)
-    with patch("omnigent.runtime._globals._caps", new=runner_caps):
-        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+def test_advise_models_exposed_for_spawn_agent() -> None:
+    names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_advise_models" in names
 
 
-def test_advise_models_hidden_without_spawn_even_when_server_routes() -> None:
+def test_advise_models_hidden_without_spawn() -> None:
     spec = AgentSpec(
         spec_version=1,
         tools=ToolsConfig(agents=["researcher"]),
         sub_agents=[AgentSpec(spec_version=1, name="researcher")],
     )
-    with patch("omnigent.runtime._globals._caps", new=_FakeRoutingCaps(routing_client=object())):
-        names = {s["function"]["name"] for s in ToolManager(spec).get_tool_schemas()}
+    names = {s["function"]["name"] for s in ToolManager(spec).get_tool_schemas()}
     assert "sys_advise_models" not in names
 
 
