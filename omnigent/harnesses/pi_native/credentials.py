@@ -571,6 +571,7 @@ def pi_own_login_routing_models(
     agent_dir: Path | None = None,
     *,
     resolver_timeout_s: float = SCOPE_RESOLVER_TIMEOUT_S,
+    scoped: bool = True,
 ) -> tuple[list[ScopableModel], dict[str, str]]:
     """List Pi's own-login models for routing, with each custom provider's endpoint.
 
@@ -581,10 +582,16 @@ def pi_own_login_routing_models(
 
     :param agent_dir: Pi agent dir override (tests); defaults to the host's own.
     :param resolver_timeout_s: Seconds Pi's ``enabledModels`` resolver may run.
+    :param scoped: ``False`` skips ``enabledModels`` (and its resolver
+        subprocess), listing every model Pi's ``--model`` can address.
     :returns: The ordered models, and ``models.json`` provider id -> ``baseUrl``.
     """
     root = agent_dir if agent_dir is not None else global_pi_agent_dir()
-    entries = _pi_own_login_scoped_models(root, resolver_timeout_s=resolver_timeout_s)
+    entries = (
+        _pi_own_login_scoped_models(root, resolver_timeout_s=resolver_timeout_s)
+        if scoped
+        else _pi_own_login_models(root)
+    )
     default_provider = _read_json_object(root / "settings.json").get("defaultProvider")
     entries.sort(key=lambda entry: entry.provider != default_provider)
     declared = _read_json_object(root / "models.json").get("providers")
@@ -594,6 +601,19 @@ def pi_own_login_routing_models(
         if isinstance(base_url, str) and base_url:
             base_urls[provider_id] = base_url
     return entries, base_urls
+
+
+def pi_own_login_default_reference(agent_dir: Path) -> str | None:
+    """Return the ``provider/model`` Pi opens with no ``--model``, per ``settings.json``.
+
+    :param agent_dir: Pi agent dir whose settings to read.
+    :returns: ``defaultProvider/defaultModel``, or ``None`` unless both are set.
+    """
+    settings = _read_json_object(agent_dir / "settings.json")
+    provider, model = settings.get("defaultProvider"), settings.get("defaultModel")
+    if isinstance(provider, str) and provider and isinstance(model, str) and model:
+        return f"{provider}/{model}"
+    return None
 
 
 def pi_own_login_model_arg(selection: str) -> str | None:

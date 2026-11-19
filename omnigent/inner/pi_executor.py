@@ -83,6 +83,7 @@ from omnigent.models.pi_model_compatibility import (
 )
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.pi_prompt import pi_prompt_args
+from omnigent.process_logging import env_truthy
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
@@ -121,6 +122,10 @@ from .executor import (
 from .model_credential import _authoritative_expiry
 
 logger = logging.getLogger(__name__)
+
+#: Host env flag: also move an explicit ``provider/model`` pin off an unreachable
+#: provider onto one serving the same model id (unpinned launches always move).
+PI_PINNED_MODEL_FALLBACK_ENV_VAR = "OMNIGENT_PI_PINNED_MODEL_FALLBACK"
 
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 # Leave time for the bridge round trip within Pi's 10-second command deadline.
@@ -2508,7 +2513,10 @@ class PiExecutor(Executor):
         default (``HARNESS_PI_MODEL`` → ``self._model_override``). On the
         Databricks-profile gateway path a missing model resolves from the
         Databricks Claude catalog — Pi's own default may be a direct-provider
-        id the gateway rejects. Elsewhere ``None`` lets Pi pick its own default.
+        id the gateway rejects. Elsewhere ``None`` lets Pi pick its own default,
+        unless that default's provider is unreachable and another serves the
+        same model id; an explicit ``provider/model`` moves likewise only when
+        :data:`PI_PINNED_MODEL_FALLBACK_ENV_VAR` is set.
 
         :param config: Optional :class:`ExecutorConfig` whose ``model``
             takes precedence when set.
@@ -2533,6 +2541,15 @@ class PiExecutor(Executor):
         # by the direct Anthropic API but not by the Databricks Unity Gateway.
         if model and self._gateway and not self._preserve_model_ids:
             model = re.sub(r"\[.*?\]$", "", model)
+        if not self._gateway:
+            model = await run_sync_on_thread(
+                model_catalog.pi_own_login_launch_model,
+                model,
+                global_pi_agent_dir(
+                    env=self._env, workspace=pathlib.Path(self._cwd) if self._cwd else None
+                ),
+                substitute_pinned=env_truthy(os.environ.get(PI_PINNED_MODEL_FALLBACK_ENV_VAR)),
+            )
         return model
 
     def _generic_openai_wire_api(self) -> str | None:

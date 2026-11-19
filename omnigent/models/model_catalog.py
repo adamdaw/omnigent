@@ -41,6 +41,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 from urllib.parse import urlsplit
 
@@ -1703,6 +1704,71 @@ def _build_pi_own_login_listing() -> ModelListing | None:
         ),
         note="models declared in Pi's own config (models.json, logins, settings.json)",
     )
+
+
+def pi_own_login_launch_model(
+    requested: str | None, agent_dir: Path, *, substitute_pinned: bool
+) -> str | None:
+    """Move a Pi own-login launch off an unreachable provider onto a healthy one.
+
+    The model checked is *requested*, or Pi's ``settings.json`` default when
+    ``None``. When its provider's ``baseUrl`` does not answer the cached
+    endpoint probe, the same model id on the first reachable provider that
+    serves it (``defaultProvider`` first, then ``models.json`` order) is
+    returned instead. Nothing is probed when Pi declares fewer than two
+    endpoints, the model's provider has no ``baseUrl``, or no other provider
+    serves the id.
+
+    :param requested: The pinned ``provider/model``, or ``None`` for Pi's default.
+    :param agent_dir: The Pi agent dir the launch reads its config from.
+    :param substitute_pinned: Whether a non-``None`` *requested* may be moved.
+    :returns: The ``provider/model`` to launch, else *requested* unchanged.
+    """
+    from omnigent.harnesses.pi_native.credentials import (
+        pi_own_login_default_reference,
+        pi_own_login_routing_models,
+    )
+
+    if requested is not None and not substitute_pinned:
+        return requested
+    entries, base_urls = pi_own_login_routing_models(agent_dir, scoped=False)
+    if len(set(base_urls.values())) < 2:
+        return requested
+    target = requested if requested is not None else pi_own_login_default_reference(agent_dir)
+    provider, _, model_id = (target or "").partition("/")
+    url = base_urls.get(provider)
+    if url is None or not model_id:
+        return requested
+    alternatives = [
+        entry
+        for entry in entries
+        if entry.model_id == model_id and base_urls.get(entry.provider, url) != url
+    ]
+    if not alternatives:
+        return requested
+    live = _pi_live_endpoints(
+        {url, *(base_urls[entry.provider] for entry in alternatives)},
+        time.monotonic() + _PI_PROBE_DEADLINE_S,
+    )
+    if url in live:
+        return requested
+    for entry in alternatives:
+        if base_urls[entry.provider] in live:
+            _logger.info(
+                "Pi provider %r is unreachable; launching %s instead of %s",
+                provider,
+                entry.reference,
+                target,
+            )
+            return entry.reference
+    _logger.warning(
+        "Pi provider %r is unreachable and no other provider serving %r answers; "
+        "launching %s anyway, and it may stall until Pi's request timeout",
+        provider,
+        model_id,
+        target,
+    )
+    return requested
 
 
 def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:

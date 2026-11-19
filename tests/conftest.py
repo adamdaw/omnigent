@@ -536,6 +536,37 @@ def _isolate_pi_host_mcp_servers(
 
 
 @pytest.fixture()
+def pi_launch_model_fallback() -> None:
+    """Opt back in to probing Pi's providers when resolving an own-login launch model.
+
+    :returns: None.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pi_launch_model_fallback(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the machine's Pi config and endpoints out of Pi launch-model resolution.
+
+    An own-login Pi launch reads the real Pi agent dir and probes its providers'
+    endpoints, so without this a developer's Pi setup would change the model a
+    test sees. Tests of that behavior request :func:`pi_launch_model_fallback`.
+
+    :param request: Pytest request, inspected for the opt-in fixture.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the resolver at teardown.
+    :returns: None.
+    """
+    if "pi_launch_model_fallback" in request.fixturenames:
+        return
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.pi_own_login_launch_model",
+        lambda requested, _agent_dir, **_options: requested,
+    )
+
+
+@pytest.fixture()
 def untracked_cache_start() -> None:
     """Opt back in to the real :meth:`GitFilesystemRegistry.start`.
 
