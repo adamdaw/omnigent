@@ -537,7 +537,10 @@ def _isolate_pi_host_mcp_servers(
 
 @pytest.fixture()
 def pi_launch_model_fallback() -> None:
-    """Opt back in to probing Pi's providers when resolving an own-login launch model.
+    """Opt back in to the real Pi own-login launch-model resolver.
+
+    Request this in any test of :func:`omnigent.models.model_catalog.pi_own_login_launch_model`
+    or of the executor wiring that calls it; without it the resolver is a pass-through.
 
     :returns: None.
     """
@@ -560,10 +563,18 @@ def _isolate_pi_launch_model_fallback(
     """
     if "pi_launch_model_fallback" in request.fixturenames:
         return
-    monkeypatch.setattr(
-        "omnigent.models.model_catalog.pi_own_login_launch_model",
-        lambda requested, _agent_dir, **_options: requested,
-    )
+
+    # Pointing PI_CODING_AGENT_DIR at an empty dir instead would clash with the
+    # tests that build ``~/.pi/agent`` under a tmp HOME, and stubbing the probe
+    # would clash with the catalog tests that stub it one level lower. The
+    # pass-through keeps the real signature, so a changed call still fails here.
+    def _pass_through(
+        requested: str | None, agent_dir: Path, *, substitute_pinned: bool
+    ) -> str | None:
+        assert isinstance(agent_dir, Path) and isinstance(substitute_pinned, bool)
+        return requested
+
+    monkeypatch.setattr("omnigent.models.model_catalog.pi_own_login_launch_model", _pass_through)
 
 
 @pytest.fixture()

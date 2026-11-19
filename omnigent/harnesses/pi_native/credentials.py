@@ -603,17 +603,18 @@ def pi_own_login_routing_models(
     return entries, base_urls
 
 
-def pi_own_login_default_reference(agent_dir: Path) -> str | None:
-    """Return the ``provider/model`` Pi opens with no ``--model``, per ``settings.json``.
+def pi_own_login_defaults(agent_dir: Path) -> tuple[str | None, str | None]:
+    """Return the ``defaultProvider`` and ``defaultModel`` from Pi's ``settings.json``.
 
     :param agent_dir: Pi agent dir whose settings to read.
-    :returns: ``defaultProvider/defaultModel``, or ``None`` unless both are set.
+    :returns: Each value, or ``None`` when unset or not a non-empty string.
     """
     settings = _read_json_object(agent_dir / "settings.json")
     provider, model = settings.get("defaultProvider"), settings.get("defaultModel")
-    if isinstance(provider, str) and provider and isinstance(model, str) and model:
-        return f"{provider}/{model}"
-    return None
+    return (
+        provider if isinstance(provider, str) and provider else None,
+        model if isinstance(model, str) and model else None,
+    )
 
 
 def pi_own_login_model_arg(selection: str) -> str | None:

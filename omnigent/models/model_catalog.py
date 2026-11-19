@@ -1725,7 +1725,7 @@ def pi_own_login_launch_model(
     :returns: The ``provider/model`` to launch, else *requested* unchanged.
     """
     from omnigent.harnesses.pi_native.credentials import (
-        pi_own_login_default_reference,
+        pi_own_login_defaults,
         pi_own_login_routing_models,
     )
 
@@ -1734,7 +1734,10 @@ def pi_own_login_launch_model(
     entries, base_urls = pi_own_login_routing_models(agent_dir, scoped=False)
     if len(set(base_urls.values())) < 2:
         return requested
-    target = requested if requested is not None else pi_own_login_default_reference(agent_dir)
+    default_provider, default_model = pi_own_login_defaults(agent_dir)
+    target = requested
+    if target is None and default_provider and default_model:
+        target = f"{default_provider}/{default_model}"
     provider, _, model_id = (target or "").partition("/")
     url = base_urls.get(provider)
     if url is None or not model_id:
@@ -1746,6 +1749,14 @@ def pi_own_login_launch_model(
     ]
     if not alternatives:
         return requested
+    # Logged-in cache entries can precede declared ones, so order explicitly.
+    declared_order = list(base_urls)
+    alternatives.sort(
+        key=lambda entry: (
+            entry.provider != default_provider,
+            declared_order.index(entry.provider),
+        )
+    )
     live = _pi_live_endpoints(
         {url, *(base_urls[entry.provider] for entry in alternatives)},
         time.monotonic() + _PI_PROBE_DEADLINE_S,

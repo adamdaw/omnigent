@@ -4808,6 +4808,11 @@ def _write_two_endpoint_pi_dir(monkeypatch: pytest.MonkeyPatch, root: Path) -> N
         (None, None, "fallback/qwen"),
         ("primary/qwen", None, "primary/qwen"),
         ("primary/qwen", "1", "fallback/qwen"),
+        # Only exactly "1" opts in; other non-empty values leave the pin alone.
+        ("primary/qwen", "true", "primary/qwen"),
+        ("primary/qwen", "yes", "primary/qwen"),
+        ("primary/qwen", "0", "primary/qwen"),
+        ("primary/qwen", " 1", "primary/qwen"),
     ],
 )
 def test_non_gateway_launch_moves_off_unreachable_pi_provider(
@@ -4820,7 +4825,8 @@ def test_non_gateway_launch_moves_off_unreachable_pi_provider(
     """
     Pi's own default provider is down: an unpinned launch takes the same model
     on a reachable provider instead of hanging; an explicit pin moves only when
-    the host sets ``OMNIGENT_PI_PINNED_MODEL_FALLBACK``.
+    the host sets ``OMNIGENT_PI_PINNED_MODEL_FALLBACK=1``. This test opts out of
+    the conftest guard, so it covers the executor's real call into the resolver.
     """
     _write_two_endpoint_pi_dir(monkeypatch, tmp_path / "pi")
     if pinned_fallback_env is None:

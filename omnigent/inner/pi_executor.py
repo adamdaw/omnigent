@@ -83,7 +83,6 @@ from omnigent.models.pi_model_compatibility import (
 )
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.pi_prompt import pi_prompt_args
-from omnigent.process_logging import env_truthy
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
@@ -123,8 +122,8 @@ from .model_credential import _authoritative_expiry
 
 logger = logging.getLogger(__name__)
 
-#: Host env flag: also move an explicit ``provider/model`` pin off an unreachable
-#: provider onto one serving the same model id (unpinned launches always move).
+#: Host env flag, exactly ``1`` to enable: also move an explicit ``provider/model`` pin
+#: off an unreachable provider onto one serving the same model id (unpinned always move).
 PI_PINNED_MODEL_FALLBACK_ENV_VAR = "OMNIGENT_PI_PINNED_MODEL_FALLBACK"
 
 _GATEWAY_AUTH_REFRESH_MS = 900_000
@@ -2548,7 +2547,7 @@ class PiExecutor(Executor):
                 global_pi_agent_dir(
                     env=self._env, workspace=pathlib.Path(self._cwd) if self._cwd else None
                 ),
-                substitute_pinned=env_truthy(os.environ.get(PI_PINNED_MODEL_FALLBACK_ENV_VAR)),
+                substitute_pinned=os.environ.get(PI_PINNED_MODEL_FALLBACK_ENV_VAR) == "1",
             )
         return model
 

@@ -3535,6 +3535,31 @@ def test_pi_pinned_launch_moves_only_when_opted_in(
 
 
 @pytest.mark.usefixtures("pi_launch_model_fallback")
+def test_pi_launch_fallback_follows_models_json_order_not_login_cache_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Logged-in cache order (``second``, ``first``) must not beat ``models.json`` order."""
+    root = tmp_path / "pi"
+    _write_pi_providers(
+        monkeypatch,
+        root,
+        {
+            name: {"baseUrl": f"http://{name}.example.com:8080/v1", "models": [{"id": "small"}]}
+            for name in ("primary", "first", "second")
+        },
+        {"defaultProvider": "primary", "defaultModel": "small"},
+    )
+    cached = {"second": {"models": [{"id": "small"}]}, "first": {"models": [{"id": "small"}]}}
+    (root / "models-store.json").write_text(json.dumps(cached))
+    (root / "auth.json").write_text(json.dumps({"second": {}, "first": {}}))
+    _pi_endpoints(monkeypatch, down={"http://primary.example.com:8080/v1"})
+
+    launched = model_catalog.pi_own_login_launch_model(None, root, substitute_pinned=False)
+
+    assert launched == "first/small"
+
+
+@pytest.mark.usefixtures("pi_launch_model_fallback")
 def test_pi_launch_with_no_reachable_provider_keeps_model_and_warns(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
