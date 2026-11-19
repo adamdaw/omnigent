@@ -2282,32 +2282,6 @@ def _validated_spec_smart_routing_harness(spec: AgentSpec) -> str | None:
     return AUTO_HARNESS_SENTINEL if value == AUTO_HARNESS_SENTINEL else PINNED_BRAIN_VALUE
 
 
-#: ``executor.config`` key making new top-level sessions of a spec start with
-#: Smart Routing on. ``on`` or ``off`` (the default).
-SMART_ROUTING_DEFAULT_CONFIG_KEY = "smart_routing_default"
-
-
-def _validated_spec_smart_routing_default(spec: AgentSpec) -> bool:
-    """
-    Read a spec's opt-in for starting its sessions with Smart Routing on.
-
-    :param spec: The bound agent's parsed spec.
-    :returns: ``True`` for ``smart_routing_default: on``; ``False`` when the
-        key is unset or ``off``.
-    :raises OmnigentError: ``invalid_input`` for any other value.
-    """
-    value = spec.executor.config.get(SMART_ROUTING_DEFAULT_CONFIG_KEY)
-    if value is None or value == "off":
-        return False
-    if value != "on":
-        raise OmnigentError(
-            f"invalid executor.config.{SMART_ROUTING_DEFAULT_CONFIG_KEY}: must be "
-            f"'on' or 'off', got {value!r}",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return True
-
-
 def _spec_brain_routing(agent: Agent, agent_cache: AgentCache | None) -> str | None:
     """Read the bound spec's ``smart_routing_harness`` value.
 
@@ -2316,17 +2290,6 @@ def _spec_brain_routing(agent: Agent, agent_cache: AgentCache | None) -> str | N
     :returns: ``"auto"``, ``"pinned"``, or ``None`` when the spec sets
         neither or cannot be loaded.
     :raises OmnigentError: ``invalid_input`` when the spec's value is invalid.
-    """
-    spec = _routing_spec(agent, agent_cache)
-    return _validated_spec_smart_routing_harness(spec) if spec is not None else None
-
-
-def _routing_spec(agent: Agent, agent_cache: AgentCache | None) -> AgentSpec | None:
-    """Load the bound spec for a create-time Smart Routing opt-in.
-
-    :param agent: The bound agent row.
-    :param agent_cache: Cache for loading the agent's parsed spec.
-    :returns: The parsed spec, or ``None`` when it cannot be loaded.
     """
     if agent_cache is None:
         return None
@@ -2339,7 +2302,7 @@ def _routing_spec(agent: Agent, agent_cache: AgentCache | None) -> AgentSpec | N
         # validation reports it.
         _logger.debug("create-time routing: agent %r failed to load", agent.name, exc_info=True)
         return None
-    return loaded.spec
+    return _validated_spec_smart_routing_harness(loaded.spec)
 
 
 def _agent_pins_its_brain(agent: Agent, agent_cache: AgentCache | None) -> bool:
@@ -13355,7 +13318,6 @@ __all__ = [
     "_resolve_subagent_spec",
     "_resource_event_item_from_sse",
     "_routing_decision_item_from_sse",
-    "_routing_spec",
     "_same_provider_family",
     "_same_provider_family_impl",
     "_seed_missing_title",
@@ -13388,7 +13350,6 @@ __all__ = [
     "_validated_cost_control_mode_override",
     "_validated_harness_override",
     "_validated_harness_override_executor_type",
-    "_validated_spec_smart_routing_default",
     "_validated_spec_smart_routing_harness",
     "_validated_subagent_routing_override",
     "_wait_for_managed_runner_tunnel",

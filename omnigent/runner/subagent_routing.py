@@ -248,11 +248,14 @@ class SessionRoutingClass:
         answer is "already routed", paid for with a round trip per prompt.
         Independent of ``routing_enabled``: a routed session keeps the
         extended catalog and its spawn routing.
+    :param pinned_brain: The session is a pinned Smart Routing brain. Its
+        spawns are confined to the session's configured accounts.
     """
 
     routing_enabled: bool = False
     auto_harness: bool = False
     turn_routing: bool = False
+    pinned_brain: bool = False
 
 
 #: The class a session with no recorded routing state is treated as. Read by
@@ -297,6 +300,7 @@ def routing_class_from_snapshot(
         routing_enabled=routes,
         auto_harness=auto,
         turn_routing=routes and not already_routed and not pinned_brain,
+        pinned_brain=pinned_brain,
     )
 
 
@@ -687,6 +691,13 @@ def _with_unadvertised_arms(models: list[str], family: str | None) -> list[str]:
     return [*models, *extra] if extra else models
 
 
+def _inside_pinned_brain_accounts(harness: str, model: str) -> bool:
+    """Whether a pinned brain's spawn may run on *harness* and *model*."""
+    from omnigent.server.smart_routing import pinned_brain_account_allows
+
+    return pinned_brain_account_allows(harness, model)
+
+
 def _routing_task(req: SubagentRouteRequest) -> str:
     """Return the task text the router should score.
 
@@ -818,7 +829,14 @@ async def _decide(
         select_router,
     )
 
+    # A pinned brain's spawns stay inside its configured accounts (see
+    # ``pinned_brain_account_allows``). Read off the session's own routing class,
+    # so the boundary holds wherever the spawn is decided.
+    account_bound = session_routing_class(session_id).pinned_brain
+
     backends = backends_from_caps(caps)
+    if account_bound and backends.external is not None:
+        return _unavailable_decision("an external router is refused for a pinned brain's spawns")
     if select_router(backends, gateway_backed=gateway_backed) is None:
         return _unavailable_decision("no routing client configured")
 
@@ -832,6 +850,14 @@ async def _decide(
             allow_static_fallback=allow_static_fallback,
         )
     )
+    if account_bound:
+        from omnigent.server.smart_routing import pinned_brain_account_allows
+
+        candidates = {
+            harness: kept
+            for harness, models in candidates.items()
+            if (kept := [m for m in models if pinned_brain_account_allows(harness, m)])
+        }
     if not candidates:
         return _unavailable_decision(f"no candidate models for harness {req.harness}")
 
@@ -865,7 +891,22 @@ async def _decide(
         )
         return _unavailable_decision(detail)
 
-    return replace(_decision_from_result(req, result, candidates), router_source=source)
+    decision = replace(_decision_from_result(req, result, candidates), router_source=source)
+    # The last check on the verdict the hook will enforce. A routed pick whose
+    # harness and model are outside the accounts is denied, never applied.
+    if (
+        account_bound
+        and decision.action in ("rewrite", "redirect")
+        and decision.model is not None
+        and not _inside_pinned_brain_accounts(decision.harness or req.harness, decision.model)
+    ):
+        return SubagentRouteDecision(
+            action="deny",
+            rationale=f"Router picked {decision.model}, outside this brain's accounts",
+            raw_model=decision.raw_model or decision.model,
+            router_source=source,
+        )
+    return decision
 
 
 def _requested_match(req: SubagentRouteRequest, model: str | None) -> bool:

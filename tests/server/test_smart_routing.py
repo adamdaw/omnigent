@@ -26,6 +26,7 @@ from omnigent.server.smart_routing import (
     fetch_runner_models,
     harness_bars_model,
     infer_models,
+    pinned_brain_account_allows,
     route_session_harness,
     route_turn,
 )
@@ -3732,3 +3733,34 @@ async def test_a_runner_rebind_invalidates_the_routing_catalog() -> None:
     await fetch_runner_models("conv_overlay", client)
 
     assert client.get.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("harness", "model", "allowed"),
+    [
+        # The claude and codex CLI logins, on their approved ids.
+        ("claude-native", "system.ai.claude-opus-4-8", True),
+        ("claude-sdk", "system.ai.claude-sonnet-5", True),
+        ("codex", "system.ai.gpt-5-5", True),
+        # pi, only with the approved ids: Claude and GPT ids it can run.
+        ("pi", "system.ai.claude-sonnet-5", True),
+        ("pi", "system.ai.gpt-5-4-nano", True),
+        # pi's gateway rejects these, so they are out of bounds.
+        ("pi", "system.ai.claude-haiku-4-5", False),
+        # Another provider's id, even under a harness in the accounts.
+        ("pi", "openrouter/mistral-large", False),
+        ("claude-sdk", "system.ai.claude-foo-9", False),
+        # A model of the wrong family for the harness.
+        ("claude-sdk", "system.ai.gpt-5-5", False),
+        # An unknown or unresolved harness fails closed.
+        ("acp", "system.ai.claude-sonnet-5", False),
+        ("auto", None, False),
+        (None, None, False),
+        # The harness alone, with no model named.
+        ("claude-native", None, True),
+    ],
+)
+def test_pinned_brain_account_boundary(
+    harness: str | None, model: str | None, allowed: bool
+) -> None:
+    assert pinned_brain_account_allows(harness, model) is allowed

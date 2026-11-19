@@ -123,12 +123,6 @@ executor:
   another family. Any other spawn keeps the family rule, and a create asking
   for `harness_override: auto` is refused.
 
-`executor.config.smart_routing_default: on` starts every new top-level session of
-the agent with Smart Routing on, whether it is created from the web UI, the CLI
-or the API. A create that sends `cost_control_mode_override: off` or
-`subagent_routing_override: off` keeps routing off. With `pinned`, the brain
-stays pinned and only its sub-agents are routed.
-
 The `cursor` harness (Cursor's `cursor-agent`) is the exception: it talks
 only to Cursor's own backend and has no custom API base-URL, so the Databricks
 gateway / `auth.type: databricks` does not apply. Authenticate it with

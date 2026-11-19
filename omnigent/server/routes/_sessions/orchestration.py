@@ -378,7 +378,6 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_subagent_spec,
     _resource_event_item_from_sse,
     _routing_decision_item_from_sse,
-    _routing_spec,
     _runner_supports_side_chat_settings,
     _RunnerForwardResult,
     _seed_missing_title_from_user_message,
@@ -396,7 +395,6 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_cost_control_mode_override,
     _validated_harness_override,
     _validated_harness_override_executor_type,
-    _validated_spec_smart_routing_default,
     _validated_spec_smart_routing_harness,
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
@@ -8437,6 +8435,7 @@ async def _forward_event_to_runner(
             )
             # For a forced-auto child, route against the parent's catalog (full
             # spawnable-worker map) rather than the child's leaf "self" catalog.
+            _auto_account_bound = await _child_of_pinned_brain(conv, conversation_store)
             _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
                 _auto_text,
                 session_id=session_id,
@@ -8444,7 +8443,11 @@ async def _forward_event_to_runner(
                 runner_client=runner_client,
                 gateway_backed=_auto_backed,
                 allow_static_fallback=_auto_backed,
+                account_bound=_auto_account_bound,
             )
+            if _auto_account_bound and _auto_harness is not None:
+                # The final pick, re-checked right before it is written to the child.
+                _assert_inside_account_boundary(_auto_harness, _auto_model)
             try:
                 # Always clear the "auto" sentinel even when routing
                 # returned no harness (unavailable/failed) so the branch
@@ -8588,6 +8591,9 @@ async def _forward_event_to_runner(
                 # spawnable workers (claude_code/codex/pi) with full model
                 # lists, whereas this child's own leaf catalog is "self"-only
                 # and would force the static fallback (a smaller/different set).
+                _child_account_bound = _parent_conv is not None and pinned_brain_session(
+                    _parent_conv
+                )
                 _routed_harness, _routed_model, _verdict, _route_err = await route_session_harness(
                     _user_text,
                     session_id=session_id,
@@ -8597,7 +8603,15 @@ async def _forward_event_to_runner(
                     harness_candidates=_child_candidates,
                     gateway_backed=_child_backed,
                     allow_static_fallback=_child_backed,
+                    account_bound=_child_account_bound,
                 )
+                if _child_account_bound and (
+                    _routed_harness is not None or _routed_model is not None
+                ):
+                    # The final pick, re-checked right before it is written to the child.
+                    _assert_inside_account_boundary(
+                        _routed_harness or _child_harness, _routed_model
+                    )
                 if _routed_model is not None:
                     effective_runner_override = _routed_model
                 try:
@@ -12515,29 +12529,67 @@ def _spec_routes_its_own_harness(
     return _spec_brain_routing(agent, agent_cache) == AUTO_HARNESS_SENTINEL
 
 
-def _spec_starts_routing_on(
-    body: SessionCreateInput,
-    agent: Agent,
-    agent_cache: AgentCache | None,
+async def _child_of_pinned_brain(
+    conv: Conversation,
+    conversation_store: ConversationStore,
 ) -> bool:
-    """Whether this create takes the spec's ``smart_routing_default: on``.
+    """Whether *conv* is a child of a pinned Smart Routing brain.
 
-    Only a top-level create the caller left routing unset on: an explicit
-    ``off`` for either routing switch wins, and a child follows its parent's
-    subagent-routing switch instead.
-
-    :param body: The validated create request.
-    :param agent: The bound agent row.
-    :param agent_cache: Cache for loading the agent's parsed spec.
-    :returns: ``True`` when ``cost_control_mode_override`` must become ``"on"``.
-    :raises OmnigentError: ``invalid_input`` when the spec's value is invalid.
+    :param conv: The child session's row.
+    :param conversation_store: Store to read the parent row from.
+    :returns: ``True`` when the parent pins its brain.
     """
-    if body.cost_control_mode_override is not None or body.subagent_routing_override == "off":
+    if conv.parent_conversation_id is None:
         return False
-    if body.parent_session_id is not None or body.sub_agent_name is not None:
-        return False
-    spec = _routing_spec(agent, agent_cache)
-    return spec is not None and _validated_spec_smart_routing_default(spec)
+    parent = await asyncio.to_thread(
+        conversation_store.get_conversation, conv.parent_conversation_id
+    )
+    return pinned_brain_session(parent)
+
+
+def _assert_inside_account_boundary(harness: str | None, model: str | None) -> None:
+    """Refuse a routed pick for a pinned brain's child outside its accounts.
+
+    :param harness: The harness the pick would run the child on.
+    :param model: The model the pick would run the child on, or ``None``.
+    :raises OmnigentError: ``invalid_input`` when the pick is outside the boundary.
+    """
+    from omnigent.server.smart_routing import pinned_brain_account_allows
+
+    if not pinned_brain_account_allows(harness, model):
+        raise OmnigentError(
+            f"routed child refused: {model or harness} on {harness} is outside the "
+            "accounts of its pinned brain",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+def _assert_pinned_child_account(
+    agent: Agent,
+    body: SessionCreateInput,
+    harness_override: str | None,
+    model_override: str | None,
+    agent_cache: AgentCache | None,
+) -> None:
+    """Refuse a create whose harness or model is outside a pinned brain's accounts.
+
+    An ``auto`` child has no harness or model yet; its first routed pick is
+    checked where that pick is applied.
+
+    :param agent: The agent row the child is created from.
+    :param body: The validated child create request.
+    :param harness_override: The harness the row is about to be created with.
+    :param model_override: The model the row is about to be created with.
+    :param agent_cache: Cache for loading the parsed bundle.
+    :raises OmnigentError: ``invalid_input`` when the harness or model is outside
+        the boundary.
+    """
+    if harness_override == "auto":
+        return
+    harness = harness_override or _create_resolved_harness(
+        agent, body.harness_override, agent_cache
+    )
+    _assert_inside_account_boundary(harness, model_override)
 
 
 def _spec_pins_its_brain(
@@ -13014,11 +13066,6 @@ async def _create_session_from_existing_agent(
         permission_store=permission_store,
         conversation_store=conversation_store,
     )
-
-    # ``smart_routing_default: on``: the session starts as if the caller had
-    # turned Smart Routing on, so every create path below sees one request.
-    if await asyncio.to_thread(_spec_starts_routing_on, body, agent, agent_cache):
-        body = body.model_copy(update={"cost_control_mode_override": "on"})
 
     # Top-level Smart Routing: "auto" on a native wrapper agent means the client
     # picked Smart Routing with no bundle agent, and its ``agent_id`` is only a
@@ -13713,6 +13760,19 @@ async def _create_session_from_existing_agent(
     if _parent_for_routing is None or _parent_for_routing.agent_id != agent.id:
         agent = await asyncio.to_thread(
             agent_for_user, agent_store, artifact_store, agent, user_id
+        )
+
+    # A pinned brain's child is created inside the session's accounts. Checked on
+    # the values the row is created with, after the inference snapshot and every
+    # other create-time substitution, so none can slip in between.
+    if _parent_for_routing is not None and pinned_brain_session(_parent_for_routing):
+        await asyncio.to_thread(
+            _assert_pinned_child_account,
+            agent,
+            body,
+            harness_override,
+            model_override,
+            agent_cache,
         )
 
     try:

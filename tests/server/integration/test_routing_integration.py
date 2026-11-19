@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from omnigent.errors import OmnigentError
 from omnigent.runner import subagent_routing
 from omnigent.runner.subagent_routing import (
     AUTO_HARNESS_LABEL_KEY,
@@ -1781,85 +1782,189 @@ async def test_a_fork_of_a_worker_is_no_longer_authorized(
     assert PINNED_BRAIN_WORKER_LABEL_KEY not in fork_conv.labels
 
 
-# ── 7e. A spec can start its sessions with Smart Routing on ────────
+# ── 7f. A pinned brain's children stay inside its accounts ────────
+
+OUTSIDE_PROVIDER_MODEL = "openrouter/mistral-large"
+OUTSIDE_CLAUDE_MODEL = "system.ai.claude-foo-9"
+INSIDE_PI_MODEL = "system.ai.claude-sonnet-5"
 
 
-@pytest.mark.parametrize(
-    ("create_overrides", "cost_control", "subagent_routing"),
-    [
-        # Nothing asked for: the spec's default turns routing on.
-        ({}, "on", "on"),
-        # An explicit off for either switch wins over the spec.
-        ({"cost_control_mode_override": "off"}, "off", None),
-        ({"subagent_routing_override": "off"}, None, "off"),
-    ],
-    ids=["default", "explicit-off", "explicit-subagent-off"],
-)
-async def test_a_spec_default_starts_its_sessions_with_routing_on(
-    client: httpx.AsyncClient,
-    db_uri: str,
-    create_overrides: dict[str, Any],
-    cost_control: str | None,
-    subagent_routing: str | None,
-) -> None:
-    case = "-".join(create_overrides) or "default"
-    agent = await create_test_agent(
-        client,
-        name=f"routing-default-{case}",
-        executor={
-            "type": "omnigent",
-            "config": {
-                "harness": "claude-sdk",
-                "smart_routing_harness": "pinned",
-                "smart_routing_default": "on",
-            },
-        },
-    )
-    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"], **create_overrides})
-    assert resp.status_code == 201, resp.text
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(str(resp.json()["id"]))
-    assert conv is not None
-    assert conv.cost_control_mode_override == cost_control
-    assert conv.subagent_routing_override == subagent_routing
-    # The brain stays pinned either way.
-    assert conv.harness_override is None
-    assert conv.labels.get(PINNED_BRAIN_LABEL_KEY) == "1"
+def _multi_provider_catalog() -> dict[str, list[Any]]:  # type: ignore[explicit-any]
+    """A runner catalog whose workers reach providers outside the accounts."""
+    from omnigent.server.smart_routing import _RunnerModel
+
+    def row(model_id: str) -> Any:  # type: ignore[explicit-any]
+        return _RunnerModel(
+            id=model_id,
+            family=None,
+            cost_tier=None,
+            wire_apis=frozenset(),
+        )
+
+    return {
+        "claude_code": [row(INSIDE_PI_MODEL), row(OUTSIDE_CLAUDE_MODEL)],
+        "codex": [row(GPT_MODEL)],
+        "pi": [row(INSIDE_PI_MODEL), row(OUTSIDE_PROVIDER_MODEL), row(GPT_MODEL)],
+    }
 
 
-async def test_a_spec_default_does_not_reach_a_child(
+async def test_a_pinned_brains_child_is_never_offered_or_routed_outside_its_accounts(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    agent = await create_test_agent(
-        client,
-        name="routing-default-child",
-        executor={"type": "omnigent", "config": {"smart_routing_default": "on"}},
+    _agent, parent, conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-boundary", smart_routing_harness="pinned"
     )
-    parent = await client.post(
-        "/v1/sessions",
-        json={"agent_id": agent["id"], "subagent_routing_override": "off"},
-    )
-    assert parent.status_code == 201, parent.text
-    child = await client.post(
-        "/v1/sessions",
-        json={"agent_id": agent["id"], "parent_session_id": parent.json()["id"]},
+    child = await _create_child(
+        client, parent.id, agent_name="pinned-brain-boundary-codex", harness="codex"
     )
     assert child.status_code == 201, child.text
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(str(child.json()["id"]))
-    assert conv is not None
-    assert conv.cost_control_mode_override is None
-    assert conv.subagent_routing_override is None
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+    assert child_conv.harness_override == "auto"
 
-
-async def test_an_invalid_spec_routing_default_is_rejected(client: httpx.AsyncClient) -> None:
-    agent = await create_test_agent(
-        client,
-        name="routing-default-invalid",
-        executor={"type": "omnigent", "config": {"smart_routing_default": "always"}},
+    # The router picks a provider outside the accounts, the first one on offer.
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=OUTSIDE_PROVIDER_MODEL, rationale="cheapest", harness="pi")
     )
-    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
-    assert resp.status_code == 400, resp.text
-    assert "smart_routing_default" in resp.text
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "review the diff"}]},
+    )
+    with (
+        patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)),
+        patch(
+            "omnigent.server.smart_routing._fetch_runner_catalog",
+            new=AsyncMock(return_value=_multi_provider_catalog()),
+        ),
+    ):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child_conv.id, child_conv, body, conv_store, runner_client
+            )
+
+    # The router was consulted, and it was offered the approved pi ids only.
+    assert routing_client.offered, "the router must be consulted for the boundary to mean anything"
+    offered = {
+        model for models in routing_client.offered for ids in models.values() for model in ids
+    }
+    assert INSIDE_PI_MODEL in offered
+    assert OUTSIDE_PROVIDER_MODEL not in offered
+    assert OUTSIDE_CLAUDE_MODEL not in offered
+    # Its pick was refused, so nothing outside the accounts was applied.
+    refreshed = conv_store.get_conversation(child_conv.id)
+    assert refreshed is not None
+    assert refreshed.model_override is None
+    assert refreshed.harness_override != "pi"
+
+
+async def test_a_forced_substitution_past_the_guard_is_denied_before_the_turn(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _agent, parent, conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-forced", smart_routing_harness="pinned"
+    )
+    child = await _create_child(
+        client, parent.id, agent_name="pinned-brain-forced-codex", harness="codex"
+    )
+    assert child.status_code == 201, child.text
+    child_conv = conv_store.get_conversation(str(child.json()["id"]))
+    assert child_conv is not None
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "review the diff"}]},
+    )
+    # A substitution that got past the router's own refusal: the guard already
+    # returned, and the verdict names a provider outside the accounts.
+    forced = AsyncMock(
+        return_value=("pi", OUTSIDE_PROVIDER_MODEL, {"model": OUTSIDE_PROVIDER_MODEL}, None)
+    )
+    with (
+        patch("omnigent.server.smart_routing.route_session_harness", new=forced),
+        patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=None)),
+    ):
+        async with echo_runner_client() as runner_client:
+            with pytest.raises(OmnigentError, match="outside the accounts"):
+                await orchestration_module._forward_event_to_runner(
+                    child_conv.id, child_conv, body, conv_store, runner_client
+                )
+    assert forced.await_count == 1
+    refreshed = conv_store.get_conversation(child_conv.id)
+    assert refreshed is not None
+    assert refreshed.model_override is None
+    assert refreshed.harness_override != "pi"
+
+
+async def test_a_pinned_brains_child_create_naming_a_model_outside_its_accounts_is_refused(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _agent, parent, _conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-create-model", smart_routing_harness="pinned"
+    )
+    child_agent = await create_test_agent(
+        client,
+        name="pinned-brain-create-model-claude",
+        executor={"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    )
+
+    refused = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": child_agent["id"],
+            "parent_session_id": parent.id,
+            "harness_override": "claude-sdk",
+            "model_override": OUTSIDE_CLAUDE_MODEL,
+        },
+    )
+    assert refused.status_code == 400, refused.text
+    assert "outside the accounts" in refused.text
+
+    # The same child, on a model inside the accounts, is created.
+    allowed = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": child_agent["id"],
+            "parent_session_id": parent.id,
+            "harness_override": "claude-sdk",
+            "model_override": INSIDE_PI_MODEL,
+        },
+    )
+    assert allowed.status_code == 201, allowed.text
+
+
+async def test_a_substitution_at_child_creation_is_refused(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _agent, parent, _conv_store = await _pinned_brain_parent(
+        client, db_uri, agent_name="pinned-brain-create-subst", smart_routing_harness="pinned"
+    )
+    child_agent = await create_test_agent(
+        client,
+        name="pinned-brain-create-subst-claude",
+        executor={"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    )
+    # The create takes an allowed model, and a step after it swaps in one
+    # outside the accounts, the way the inference snapshot can.
+    substituted = AsyncMock(return_value=(None, OUTSIDE_CLAUDE_MODEL))
+    with patch(
+        "omnigent.server.routes.sandbox_inference.prepare_create_inference",
+        new=substituted,
+    ):
+        refused = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": child_agent["id"],
+                "parent_session_id": parent.id,
+                "harness_override": "claude-sdk",
+                "model_override": INSIDE_PI_MODEL,
+            },
+        )
+    assert substituted.await_count == 1
+    assert refused.status_code == 400, refused.text
+    assert "outside the accounts" in refused.text
 
 
 # ── 8. Truthful record on a claude-native turn ─────────────────────

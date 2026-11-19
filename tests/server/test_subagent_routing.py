@@ -366,6 +366,32 @@ async def test_an_explicit_in_family_ask_is_still_routed(
     assert decision_record(req, decision).attempted_override == recorded_override
 
 
+async def test_a_pinned_brains_spawn_is_offered_only_in_account_models() -> None:
+    """A provider outside the brain's accounts is never offered to the router."""
+    outside = "system.ai.claude-foo-9"
+    session_id = "pinned-brain-spawn-boundary"
+    remember_session_routing_class(
+        session_id, SessionRoutingClass(routing_enabled=True, pinned_brain=True)
+    )
+    try:
+        client = FakeRoutingClient(
+            RoutingResult(model=outside, rationale="cheapest", harness="claude-native")
+        )
+        decision = await resolve_subagent_route(
+            session_id,
+            _request(harness="claude-native", prompt="review the diff"),
+            caps=FakeCaps(routing_client=client),
+            catalog={"self": [CLAUDE_MODEL, outside]},
+        )
+    finally:
+        forget_session_routing_class(session_id)
+    offered = {m for call in client.offered for ms in call.values() for m in ms}
+    assert CLAUDE_MODEL in offered
+    assert outside not in offered
+    assert decision.action == "deny"
+    assert decision.model is None
+
+
 async def test_the_router_is_called_even_when_the_spawn_names_a_model() -> None:
     """Regression: a ``requested_model`` used to skip ``client.route`` entirely,
     so every rationale read "it is a routable arm" and no rule trace existed."""
@@ -1239,7 +1265,7 @@ def test_subagent_routing_enabled_is_two_state(override: str | None, expected: b
             "on",
             "claude-native",
             {PINNED_BRAIN_LABEL_KEY: "1"},
-            SessionRoutingClass(routing_enabled=True),
+            SessionRoutingClass(routing_enabled=True, pinned_brain=True),
         ),
     ],
 )

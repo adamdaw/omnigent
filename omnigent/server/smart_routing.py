@@ -200,6 +200,63 @@ def catalog_models_for_harness(
     return None
 
 
+def _pinned_brain_account_ids(family: str, prefixes: Sequence[str] | None) -> frozenset[str]:
+    """The model ids a pinned brain's children may run on, for one family.
+
+    The owned static tables: the family's ladder and its current-generation
+    arms. Pi's gateway rejects some of its ladder, so those come out.
+
+    :param family: ``"claude"``, ``"gpt"`` or ``"pi"``.
+    :param prefixes: Catalog prefixes to strip before comparing ids.
+    :returns: Bare, comparison-spelled ids.
+    """
+    ids = {
+        _bare_id(model, prefixes)
+        for model in (*MODEL_LISTS[family], *_CURRENT_GENERATION_MODELS.get(family, ()))
+    }
+    if family == "pi":
+        ids -= {_bare_id(model, prefixes) for model in SMART_ROUTING_PI_EXCLUDED}
+    return frozenset(ids)
+
+
+def pinned_brain_account_allows(harness: str | None, model: str | None = None) -> bool:
+    """Whether a pinned brain's child may run on *harness* and *model*.
+
+    A pinned brain's children stay inside the session's configured accounts:
+    the claude and codex CLI logins, and pi only with the approved ids. Any
+    other harness, any model outside the approved ids, and any provider's id
+    are outside the boundary. An unknown or multi-family harness is outside it
+    too, so the check fails closed.
+
+    :param harness: Harness id, e.g. ``"claude-native"``.
+    :param model: Model id, or ``None`` to check the harness alone.
+    :returns: ``True`` when the pairing is inside the boundary.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.runner.subagent_routing import harness_family
+
+    family = harness_family(canonicalize_harness(harness))
+    if family is None or family not in MODEL_LISTS:
+        return False
+    if model is None:
+        return True
+    prefixes = routing_settings().model_prefixes
+    return _bare_id(model, prefixes) in _pinned_brain_account_ids(family, prefixes)
+
+
+def _within_account_boundary(harness: str, models: Iterable[str], *, bound: bool) -> list[str]:
+    """Keep the models a pinned brain's child may be offered, when *bound*.
+
+    :param harness: Harness id the models are offered for.
+    :param models: Candidate model ids.
+    :param bound: ``True`` for a pinned brain's child; ``False`` passes all.
+    :returns: The candidates inside the boundary, order preserved.
+    """
+    if not bound:
+        return list(models)
+    return [model for model in models if pinned_brain_account_allows(harness, model)]
+
+
 def failure_detail(exc: BaseException) -> str:
     """Describe *exc* for a routing decline the user reads.
 
@@ -2156,6 +2213,7 @@ async def route_session_harness(
     catalog: Mapping[str, Sequence[str]] | None = None,
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
+    account_bound: bool = False,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
@@ -2193,6 +2251,10 @@ async def route_session_harness(
         may supply or top up candidates. Callers pass ``gateway_backed``: that
         table is all ``databricks-*`` ids, so off the gateway it would offer
         models the pane cannot run. ``False`` declines instead.
+    :param account_bound: ``True`` for a pinned brain's child. The router is
+        offered only harnesses and models inside the session's accounts
+        (:func:`pinned_brain_account_allows`), an external router is refused, and
+        the final pick is checked against the same boundary before it returns.
     :returns: ``(harness, model, verdict, error)`` — on success ``error`` is
         ``None``; on failure ``harness``, ``model``, and ``verdict`` are ``None``
         and ``error`` carries a human-readable reason shown in the UI.
@@ -2211,6 +2273,14 @@ async def route_session_harness(
     )
 
     backends = backends_from_caps(_caps)
+    if account_bound and backends.external is not None:
+        # The external router is a hosted service outside the session's accounts.
+        return (
+            None,
+            None,
+            None,
+            "Routing for a pinned brain's child is refused: an external router is configured.",
+        )
     if select_router(backends, gateway_backed=gateway_backed) is None:
         return None, None, None, "Smart routing is not configured on this server."
 
@@ -2232,7 +2302,8 @@ async def route_session_harness(
         for h in (
             _AUTO_ROUTING_HARNESSES if harness_candidates is None else tuple(harness_candidates)
         )
-        if allowed_family is None or _HARNESS_FAMILY.get(h) == allowed_family
+        if (allowed_family is None or _HARNESS_FAMILY.get(h) == allowed_family)
+        and (not account_bound or pinned_brain_account_allows(h))
     )
     harness_models: dict[str, list[str]] = {}
     harness_catalog: dict[str, list[_RunnerModel]] = {}
@@ -2241,7 +2312,11 @@ async def route_session_harness(
             harness = _WORKER_NAME_TO_HARNESS.get(worker_name)
             if harness is None or harness not in candidate_harnesses:
                 continue
-            in_family = models_in_family(harness, [entry.id for entry in worker_catalog])
+            in_family = _within_account_boundary(
+                harness,
+                models_in_family(harness, [entry.id for entry in worker_catalog]),
+                bound=account_bound,
+            )
             if in_family:
                 # First worker wins for a given harness id (dedupe). The catalog
                 # rows are kept alongside the ids so the post-verdict wire check
@@ -2253,7 +2328,11 @@ async def route_session_harness(
     # caller's pre-session catalog, family-filtered like the live one.
     if not harness_models and catalog:
         for h in candidate_harnesses:
-            in_family = models_in_family(h, catalog.get(h) or ())
+            in_family = _within_account_boundary(
+                h,
+                models_in_family(h, catalog.get(h) or ()),
+                bound=account_bound,
+            )
             if in_family:
                 harness_models[h] = in_family
 
@@ -2271,7 +2350,7 @@ async def route_session_harness(
         for h in candidate_harnesses:
             if h in harness_models:
                 continue
-            models = infer_models(h)
+            models = _within_account_boundary(h, infer_models(h) or (), bound=account_bound)
             if models:
                 harness_models[h] = models
 
@@ -2375,6 +2454,21 @@ async def route_session_harness(
     }
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(chosen_model, prefixes):
         verdict["raw_model"] = raw_model
+
+    # The last check on the final pick, after every substitution above. A pick
+    # outside the accounts is refused, never applied.
+    if account_bound and not pinned_brain_account_allows(chosen_harness, chosen_model):
+        _logger.warning(
+            "smart_routing: refused pick harness=%s model=%s outside a pinned brain's accounts",
+            chosen_harness,
+            chosen_model,
+        )
+        return (
+            None,
+            None,
+            None,
+            f"Refused: {chosen_model} on {chosen_harness} is outside this brain's accounts.",
+        )
 
     _logger.info(
         "smart_routing: auto-harness harness=%s model=%s",
