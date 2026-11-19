@@ -19,6 +19,7 @@ from omnigent.runner.subagent_routing import (
     ADVERTISEMENT_FILE,
     AUTO_HARNESS_LABEL_KEY,
     PINNED_BRAIN_LABEL_KEY,
+    PINNED_BRAIN_WORKER_LABEL_KEY,
     PLAIN_SESSION,
     ROUTING_DECISION_LABEL_KEY,
     SessionRoutingClass,
@@ -216,11 +217,11 @@ class _Conv:
         self,
         labels: dict[str, str] | None = None,
         harness_override: str | None = None,
-        sub_agent_name: str | None = None,
+        id: str = "conv_row",
     ):
         self.labels = labels or {}
         self.harness_override = harness_override
-        self.sub_agent_name = sub_agent_name
+        self.id = id
 
 
 @pytest.mark.parametrize(
@@ -269,20 +270,26 @@ def test_auto_harness_session_is_the_only_cross_harness_enabler(
     assert auto_harness_session(conv, parent) is expected
 
 
+_PINNED_BRAIN = _Conv(labels={PINNED_BRAIN_LABEL_KEY: "1"}, id="conv_brain")
+_WORKER = _Conv(labels={PINNED_BRAIN_WORKER_LABEL_KEY: "conv_brain"})
+
+
 @pytest.mark.parametrize(
     ("conv", "parent", "expected"),
     [
-        (_Conv(sub_agent_name="codex"), _Conv(labels={PINNED_BRAIN_LABEL_KEY: "1"}), True),
-        # An undeclared spawn of a pinned brain keeps the family rule.
-        (_Conv(), _Conv(labels={PINNED_BRAIN_LABEL_KEY: "1"}), False),
-        # A declared worker of an ordinary pinned parent keeps it too.
-        (_Conv(sub_agent_name="codex"), _Conv(harness_override="claude-sdk"), False),
-        (_Conv(sub_agent_name="codex"), None, False),
-        (None, _Conv(labels={PINNED_BRAIN_LABEL_KEY: "1"}), False),
+        (_WORKER, _PINNED_BRAIN, True),
+        # A child the create never authorized keeps the family rule.
+        (_Conv(), _PINNED_BRAIN, False),
+        # An authorization names one parent; it does not carry to another.
+        (_WORKER, _Conv(labels={PINNED_BRAIN_LABEL_KEY: "1"}, id="conv_other"), False),
+        # A parent that no longer pins its brain authorizes nothing.
+        (_WORKER, _Conv(harness_override="claude-sdk", id="conv_brain"), False),
+        (_WORKER, None, False),
+        (None, _PINNED_BRAIN, False),
     ],
-    ids=["declared-worker", "undeclared", "no-opt-in", "no-parent", "no-row"],
+    ids=["authorized", "unauthorized", "other-parent", "no-opt-in", "no-parent", "no-row"],
 )
-def test_only_a_pinned_brains_declared_worker_may_leave_its_family(
+def test_only_a_pinned_brains_authorized_worker_may_leave_its_family(
     conv: _Conv | None,
     parent: _Conv | None,
     expected: bool,

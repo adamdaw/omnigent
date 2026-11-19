@@ -11508,14 +11508,18 @@ def _reject_server_reserved_label_seed(
             " and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
-    from omnigent.runner.subagent_routing import PINNED_BRAIN_LABEL_KEY
+    from omnigent.runner.subagent_routing import (
+        PINNED_BRAIN_LABEL_KEY,
+        PINNED_BRAIN_WORKER_LABEL_KEY,
+    )
 
-    # Forging it would let a session's children escape its model family.
-    if PINNED_BRAIN_LABEL_KEY in labels:
-        raise OmnigentError(
-            f"label {PINNED_BRAIN_LABEL_KEY!r} is server-internal and cannot be set by clients",
-            code=ErrorCode.INVALID_INPUT,
-        )
+    # Forging either would let a session's children escape its model family.
+    for key in (PINNED_BRAIN_LABEL_KEY, PINNED_BRAIN_WORKER_LABEL_KEY):
+        if key in labels:
+            raise OmnigentError(
+                f"label {key!r} is server-internal and cannot be set by clients",
+                code=ErrorCode.INVALID_INPUT,
+            )
     # The archive timestamp is stamped by the server on the archive transition
     # only; a client write would forge the retention clock, including on shared
     # sessions the caller does not own.

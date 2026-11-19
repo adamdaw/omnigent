@@ -121,6 +121,12 @@ AUTO_HARNESS_LABEL_KEY = "omnigent.routing.auto_harness"
 #: and a declared worker may run in another family. Server-stamped at create.
 PINNED_BRAIN_LABEL_KEY = "omnigent.routing.pinned_brain"
 
+#: Conversation label authorizing a child to run outside its pinned-brain
+#: parent's family. Its value is the parent's session id. Server-stamped only
+#: by the child create, after it checked the child is a worker the parent's
+#: bundle declares, running on that worker's declared harness.
+PINNED_BRAIN_WORKER_LABEL_KEY = "omnigent.routing.pinned_brain_worker"
+
 _SCOPE = "native_subagent"
 _PROMPT_CAP = 4000
 #: Task label scored for a codex spawn that carries no prompt and no
@@ -555,15 +561,20 @@ def declared_worker_of_pinned_brain(conv: Any, parent: Any) -> bool:
 
     Such a worker may run in another model family than its parent: the
     parent's spec chose the worker's harness, and the worker is routed on it.
+    Only the create-time authorization counts (see
+    :data:`PINNED_BRAIN_WORKER_LABEL_KEY`), never the child's
+    ``sub_agent_name``, which other paths fill from event data.
 
     :param conv: The child session's row, or ``None``.
     :param parent: The parent session's row, or ``None``.
-    :returns: ``True`` when the parent pins its brain and the child is one of
-        its named sub-agents.
+    :returns: ``True`` when the parent pins its brain and authorized this
+        child at its create.
     """
-    if conv is None or not pinned_brain_session(parent):
+    if conv is None or parent is None or not pinned_brain_session(parent):
         return False
-    return bool(getattr(conv, "sub_agent_name", None))
+    labels = getattr(conv, "labels", None) or {}
+    parent_id = getattr(parent, "id", None)
+    return bool(parent_id) and labels.get(PINNED_BRAIN_WORKER_LABEL_KEY) == parent_id
 
 
 def model_in_family(family: str | None, model: str) -> bool:
