@@ -152,6 +152,8 @@ def check_smart_routing_available(
             state = _gateway_state(remote or {}, harness)
         if state is None or state is True:
             continue
+        if sources["external_non_gateway"]:
+            continue
         if sources["oss"]:
             # Off the gateway the Unity Gateway's router cannot be applied here,
             # but the server's built-in one still answers.
@@ -185,8 +187,13 @@ def _routing_sources(info: dict[str, Any]) -> dict[str, bool]:
     enabled = info.get("smart_routing_enabled") is True
     raw = info.get("smart_routing_sources")
     if not isinstance(raw, dict):
-        return {"external": enabled, "oss": enabled}
-    return {"external": raw.get("external") is True, "oss": raw.get("oss") is True}
+        return {"external": enabled, "oss": enabled, "external_non_gateway": False}
+    return {
+        "external": raw.get("external") is True,
+        "oss": raw.get("oss") is True,
+        "external_non_gateway": raw.get("external_non_gateway") is True
+        and raw.get("external") is True,
+    }
 
 
 def arm_smart_routing_session(

@@ -2398,3 +2398,45 @@ def test_routed_spelling_types_a_managed_picker_row_verbatim() -> None:
         )
     finally:
         _orchestration._model_options_cache.pop("conv_managed", None)
+
+
+async def test_opted_in_external_without_judge_passes_create_gates() -> None:
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routing_backend import RoutingBackends
+
+    router = FakeRoutingClient(
+        RoutingResult(model="gpt-5-5", rationale="chosen", harness="codex-native")
+    )
+    caps = FakeCaps(
+        routing_client=router, routing_backends=RoutingBackends(external=router, non_gateway=True)
+    )
+    host = _host_reporting({"claude-native": False, "codex-native": False})
+    body = SimpleNamespace(
+        host_id="host_1",
+        smart_routing_message=ROUTING_MESSAGE,
+        cost_control_mode_override="on",
+        parent_session_id=None,
+        sub_agent_name=None,
+        harness_override=None,
+    )
+    with (
+        patch("omnigent.runtime._globals._caps", new=caps),
+        patch.object(orchestration, "_create_resolved_harness", return_value="claude-native"),
+        patch.object(
+            orchestration,
+            "_pre_session_model_catalog",
+            AsyncMock(return_value=dict(_OFF_GATEWAY_CATALOG)),
+        ),
+    ):
+        await orchestration._reject_ungatewayed_model_routing(
+            cast("Any", body),
+            cast("Any", _routing_request(host)),
+            "alice@example.com",
+            cast("Any", None),
+            cast("Any", None),
+        )
+        agent, model, verdict, error = await orchestration._resolve_native_smart_routing(
+            cast("Any", body), cast("Any", _routing_request(host)), "alice@example.com"
+        )
+    assert error is None and (agent, model) == ("codex-native-ui", "gpt-5-5")
+    assert verdict is not None and verdict["router_source"] == "external"

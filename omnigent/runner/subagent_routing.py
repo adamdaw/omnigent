@@ -557,6 +557,7 @@ def candidate_models(
     cross_harness: bool = False,
     catalog: Mapping[str, list[str]] | None = None,
     allow_static_fallback: bool = True,
+    gateway_backed: bool = True,
 ) -> dict[str, list[str]]:
     """Build the harness → models map offered to the router.
 
@@ -604,8 +605,9 @@ def candidate_models(
         # Offer each model under the spelling the gateway serves, so the
         # spawn's model matches what routing resolves to; dedupe when the
         # catalog carries both spellings.
-        models = list(dict.fromkeys(apply_servable_alias(m) for m in models))
-        models = _with_unadvertised_arms(models, family)
+        if gateway_backed:
+            models = list(dict.fromkeys(apply_servable_alias(m) for m in models))
+            models = _with_unadvertised_arms(models, family)
         if models:
             result[candidate] = models
     return result
@@ -785,6 +787,7 @@ async def _decide(
             cross_harness=cross_harness,
             catalog=catalog,
             allow_static_fallback=allow_static_fallback,
+            gateway_backed=gateway_backed,
         )
     )
     if not candidates:
@@ -814,9 +817,10 @@ async def _decide(
     else:
         if call is not None:
             result, client, source = call.result, call.client, call.source
+            raised = call.reason
     if result is None or not getattr(result, "model", None):
         detail = (
-            _opt_str(getattr(client, "last_error", None)) or raised or "router returned no verdict"
+            raised or _opt_str(getattr(client, "last_error", None)) or "router returned no verdict"
         )
         return _unavailable_decision(detail)
 

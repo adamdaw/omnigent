@@ -2806,6 +2806,8 @@ function NewChatLandingContent({
   // reads as neither, so no routing surface flashes in before the probe lands.
   const externalRoutingConfigured = info !== "loading" && info.smart_routing_sources.external;
   const ossRoutingConfigured = info !== "loading" && info.smart_routing_sources.oss;
+  const externalNonGateway =
+    info !== "loading" && info.smart_routing_sources.external_non_gateway === true;
   // Gates the whole UI-driven setup experience (Set up affordance + dialog +
   // collapsed badge). OFF → the composer/picker fall back to the original
   // "run omni setup" guidance, so a disabled flag is a no-op on the UI.
@@ -3952,6 +3954,7 @@ function NewChatLandingContent({
     SMART_ROUTING_ARMS.some((harness) => harness === selectedNativeHarness) &&
     smartRoutingSourceFor({
       externalConfigured: externalRoutingConfigured,
+      externalNonGateway,
       ossConfigured: ossRoutingConfigured,
       gatewayBacked: hostBacksHarnessWithGateway(harnessWarningHost, selectedNativeHarness),
     }) !== null;
@@ -3967,6 +3970,7 @@ function NewChatLandingContent({
     (harness) =>
       smartRoutingSourceFor({
         externalConfigured: externalRoutingConfigured,
+        externalNonGateway,
         ossConfigured: ossRoutingConfigured,
         gatewayBacked: hostBacksHarnessWithGateway(harnessWarningHost, harness),
       }) !== null,
@@ -5056,11 +5060,18 @@ function NewChatLandingContent({
         // rewrites through. The built-in judge routes a model inside one
         // harness and can't stand in here.
         externalRoutingAvailable: externalRoutingConfigured,
+        externalNonGateway,
         notGatewayBackedHarnesses: SMART_ROUTING_ARMS.filter(
           (harness) => !hostBacksHarnessWithGateway(harnessWarningHost, harness),
         ),
       }),
-    [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, externalRoutingConfigured],
+    [
+      smartRoutingEnabled,
+      smartRoutingWrappers,
+      harnessWarningHost,
+      externalRoutingConfigured,
+      externalNonGateway,
+    ],
   );
   // The curated menu has no Smart Routing row, so a remembered pick of it has
   // nothing behind it either.

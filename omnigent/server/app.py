@@ -242,6 +242,7 @@ class _HostOfflineHold:
 
 
 class SmartRoutingSourcesInfo(BaseModel):
+    external_non_gateway: bool = False
     external: bool
     oss: bool
 
@@ -4107,7 +4108,11 @@ def create_app(
             smart_routing_sources = routing_sources(_caps)
         except ImportError:
             smart_routing_enabled = False
-            smart_routing_sources = {"external": False, "oss": False}
+            smart_routing_sources = {
+                "external": False,
+                "oss": False,
+                "external_non_gateway": False,
+            }
         # Resolve the gate per request with the same resolver used by route enforcement.
         current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
         frontend_features = app.state.feature_flags.frontend_dict()

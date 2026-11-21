@@ -746,3 +746,25 @@ def test_smart_routing_entry_points_error_on_an_ungatewayed_harness(
     # Nothing was created: a pick that cannot be applied is not attempted, so
     # preflight's reads are the only traffic.
     assert all(call.request.method == "GET" for call in respx.calls)
+
+
+@respx.mock
+def test_preflight_allows_opted_in_external_without_judge(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    _mock_local_gateway(monkeypatch, {"claude-native": False})
+    respx.get(f"{_BASE}/v1/info").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "smart_routing_enabled": True,
+                "smart_routing_sources": {
+                    "external": True,
+                    "oss": False,
+                    "external_non_gateway": True,
+                },
+            },
+        )
+    )
+    check_smart_routing_available(base_url=_BASE, harnesses=("claude-native",))
+    assert "built-in" not in capsys.readouterr().err

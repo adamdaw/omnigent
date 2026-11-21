@@ -120,7 +120,11 @@ async def test_the_not_enabled_404_is_asked_once_per_process(router: MockRouter)
         second = await route_turn("claude-sdk", TRIVIAL, catalog=CLAUDE_CATALOG)
         # The condition is account-level, so the report stops advertising a
         # router that can only decline — without persisting anything.
-        assert routing_sources(caps) == {"external": False, "oss": True}
+        assert routing_sources(caps) == {
+            "external": False,
+            "oss": True,
+            "external_non_gateway": False,
+        }
         choice = select_router(
             RoutingBackends(external=external, local=judge), gateway_backed=True
         )

@@ -122,3 +122,44 @@ def test_an_unusable_config_leaves_routing_off() -> None:
             {"routing": {"provider": "judge"}}, None, RoutingSettings()
         )
     assert (backends.external, backends.local) == (None, None)
+
+
+@pytest.mark.parametrize(("value", "expected"), [(True, True), (False, False), ("true", False)])
+def test_external_non_gateway_requires_explicit_boolean(value: Any, expected: bool) -> None:
+    cfg = {
+        "routing": {
+            "provider": "external",
+            "base_url": "https://router.invalid",
+            "router_name": "winnow",
+            "non_gateway": value,
+        }
+    }
+    backends = _build_routing_backends(cfg, None, RoutingSettings())
+    assert backends.non_gateway is expected
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, 3.0), (1.5, 1.5), (9, 3.0), ("bad", 3.0)])
+def test_opted_in_external_timeout_budget(value: Any, expected: float) -> None:
+    config: dict[str, Any] = {
+        "provider": "external",
+        "base_url": "https://router.invalid",
+        "router_name": "winnow",
+        "non_gateway": True,
+    }
+    if value is not None:
+        config["request_timeout"] = value
+    backends = _build_routing_backends({"routing": config}, None, RoutingSettings())
+    assert backends.external._request_timeout == expected
+
+
+@pytest.mark.parametrize(
+    "routing",
+    [
+        {"provider": "judge", "non_gateway": True},
+        {"provider": "external", "non_gateway": "yes"},
+        {"provider": "external", "non_gatway": True},
+    ],
+)
+def test_invalid_non_gateway_config_warns(routing: dict[str, Any], capsys: Any) -> None:
+    _build_routing_backends({"routing": routing}, None, RoutingSettings())
+    assert "non_gateway" in capsys.readouterr().err

@@ -1486,3 +1486,32 @@ def test_decision_record_names_the_task_it_governed() -> None:
     assert record.task_description == "Implement token refresh"
     # A spawn that carried no label records none.
     assert decision_record(_request(), decision).task_description is None
+
+
+async def test_opted_in_external_routes_off_gateway_spawn() -> None:
+    from omnigent.server.routing_backend import RoutingBackends
+
+    external = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="external"))
+    local = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="local"))
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=local, non_gateway=True),
+    )
+    decision = await resolve_subagent_route(
+        "conv_optin", _request(), caps=caps, gateway_backed=False
+    )
+    assert decision.router_source == "external"
+    assert external.calls
+    assert not local.calls
+
+
+def test_off_gateway_candidates_keep_catalog_spelling_without_gateway_arms() -> None:
+    from omnigent.runner.subagent_routing import candidate_models
+
+    offered = candidate_models(
+        "codex-native",
+        catalog={"self": ["glm-5-2"]},
+        gateway_backed=False,
+        allow_static_fallback=False,
+    )
+    assert offered == {"codex-native": ["glm-5-2"]}

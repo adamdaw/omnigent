@@ -197,7 +197,7 @@ def test_routing_available_from_the_backends_pair_alone() -> None:
         policy_llm_connection_factory=None,
     )
     assert routing_available(caps) is True
-    assert routing_sources(caps) == {"external": True, "oss": False}
+    assert routing_sources(caps) == {"external": True, "oss": False, "external_non_gateway": False}
 
 
 def test_routing_available_from_a_local_only_backends_pair() -> None:
@@ -207,7 +207,7 @@ def test_routing_available_from_a_local_only_backends_pair() -> None:
         policy_llm_connection_factory=None,
     )
     assert routing_available(caps) is True
-    assert routing_sources(caps) == {"external": False, "oss": True}
+    assert routing_sources(caps) == {"external": False, "oss": True, "external_non_gateway": False}
 
 
 def test_routing_available_from_the_managed_policy_llm_factory() -> None:
@@ -218,13 +218,13 @@ def test_routing_available_from_the_managed_policy_llm_factory() -> None:
         policy_llm_connection_factory=lambda: None,
     )
     assert routing_available(caps) is True
-    assert routing_sources(caps) == {"external": False, "oss": True}
+    assert routing_sources(caps) == {"external": False, "oss": True, "external_non_gateway": False}
 
 
 def test_routing_available_from_a_legacy_single_client() -> None:
     caps = _caps(routing_backends=None, routing_client=_LOCAL, policy_llm_connection_factory=None)
     assert routing_available(caps) is True
-    assert routing_sources(caps) == {"external": False, "oss": True}
+    assert routing_sources(caps) == {"external": False, "oss": True, "external_non_gateway": False}
 
 
 @pytest.mark.parametrize(
@@ -241,7 +241,11 @@ def test_routing_available_from_a_legacy_single_client() -> None:
 )
 def test_routing_unavailable_when_nothing_is_configured(caps: Any) -> None:
     assert routing_available(caps) is False
-    assert routing_sources(caps) == {"external": False, "oss": False}
+    assert routing_sources(caps) == {
+        "external": False,
+        "oss": False,
+        "external_non_gateway": False,
+    }
 
 
 @pytest.mark.parametrize(
@@ -295,7 +299,7 @@ def test_routing_sources_stops_advertising_a_tripped_router() -> None:
         routing_client=None,
         policy_llm_connection_factory=None,
     )
-    assert routing_sources(caps) == {"external": False, "oss": True}
+    assert routing_sources(caps) == {"external": False, "oss": True, "external_non_gateway": False}
     assert routing_available(caps) is True
 
 
@@ -399,3 +403,44 @@ async def test_route_with_fallback_uses_the_judge_off_the_gateway() -> None:
 
 async def test_route_with_fallback_reports_an_unconfigured_deployment() -> None:
     assert await route_with_fallback(RoutingBackends(), "hi", _MENU, gateway_backed=True) is None
+
+
+def test_non_gateway_external_opt_in() -> None:
+    backends = RoutingBackends(external=_EXTERNAL, local=_LOCAL, non_gateway=True)
+    choice = select_router(backends, gateway_backed=False)
+    assert choice is not None
+    assert choice.client is _EXTERNAL
+
+
+@pytest.mark.parametrize("error", [None, RuntimeError("error"), TimeoutError("timeout")])
+async def test_non_gateway_external_failure_falls_back(error: Exception | None) -> None:
+    external = _Recording(None, error=error)
+    local = _Recording(_VERDICT)
+    call = await route_with_fallback(
+        RoutingBackends(external=external, local=local, non_gateway=True),
+        "hi",
+        _MENU,
+        gateway_backed=False,
+    )
+    assert call is not None and (call.result, call.source) == (_VERDICT, "oss-llm")
+    assert external.calls == local.calls == 1
+
+
+async def test_timed_out_judge_reports_per_call_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    from omnigent.server import routing_backend
+
+    class SlowJudge:
+        async def route(self, message: str, available_models: dict[str, list[str]]) -> None:
+            await asyncio.sleep(1)
+
+    monkeypatch.setattr(routing_backend, "NON_GATEWAY_JUDGE_TIMEOUT_S", 0.01)
+    call = await route_with_fallback(
+        RoutingBackends(external=_Recording(None), local=SlowJudge(), non_gateway=True),
+        "hi",
+        _MENU,
+        gateway_backed=False,
+    )
+    assert call is not None and call.result is None
+    assert call.reason == "judge timed out"

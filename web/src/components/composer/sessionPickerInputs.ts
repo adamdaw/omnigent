@@ -73,6 +73,7 @@ export function isCostRoutingEligible(
   return (
     smartRoutingSourceFor({
       externalConfigured: serverInfo.smart_routing_sources.external,
+      externalNonGateway: serverInfo.smart_routing_sources.external_non_gateway,
       ossConfigured: serverInfo.smart_routing_sources.oss,
       gatewayBacked: hostBacksHarnessWithGateway(host, native.harness),
     }) !== null

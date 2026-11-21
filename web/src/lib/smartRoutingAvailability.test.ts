@@ -290,3 +290,24 @@ describe("smartRoutingDroppedMessage", () => {
     ).toBe("Smart Routing needs Codex ready — switched to the default agent.");
   });
 });
+
+it("uses an opted-in external router off the gateway", () => {
+  expect(
+    smartRoutingSourceFor({
+      externalConfigured: true,
+      ossConfigured: false,
+      gatewayBacked: false,
+      externalNonGateway: true,
+    }),
+  ).toBe("external");
+  expect(
+    smartRoutingUnavailableReason({
+      routingEnabled: true,
+      wrappersRegistered: true,
+      unreadyHarnesses: [],
+      externalRoutingAvailable: true,
+      externalNonGateway: true,
+      notGatewayBackedHarnesses: ["codex-native"],
+    }),
+  ).toBeNull();
+});
