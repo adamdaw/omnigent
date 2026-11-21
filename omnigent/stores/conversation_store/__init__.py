@@ -2415,6 +2415,7 @@ class ConversationStore(ABC):
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         model_override: str | None = None,
+        cost_control_mode_override: str | None = None,
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,

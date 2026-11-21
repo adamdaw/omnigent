@@ -11694,6 +11694,7 @@ def _persist_stored_session_bundle(
     inference_model: str | None = None,
     git_branch: str | None = None,
     created_by: str | None = None,
+    cost_control_mode_override: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -11741,6 +11742,7 @@ def _persist_stored_session_bundle(
             project_id=metadata.project_id,
             host_id=metadata.host_id,
             created_by=created_by,
+            cost_control_mode_override=cost_control_mode_override,
             **inference_kwargs,
         )
     except ConversationNotFoundError as exc:
@@ -11794,6 +11796,7 @@ def _persist_session_for_uploaded_agent(
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
     git_branch: str | None = None,
+    cost_control_mode_override: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist a top-level session bound to the agent row of an earlier, identical upload.
@@ -11823,6 +11826,7 @@ def _persist_session_for_uploaded_agent(
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
             model_override=inference_model,
+            cost_control_mode_override=cost_control_mode_override,
         )
     except IntegrityError as exc:
         raise OmnigentError(

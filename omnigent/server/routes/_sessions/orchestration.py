@@ -12552,6 +12552,25 @@ def _spec_starts_routing_on(
     return spec is not None and _validated_spec_smart_routing_default(spec)
 
 
+def _bundle_spec_starts_routing_on(metadata: SessionCreateMetadata, spec: AgentSpec) -> bool:
+    """Whether an uploaded bundle's top-level session takes ``smart_routing_default: on``.
+
+    An upload carries no routing override of its own, so only a top-level
+    create is considered; a child upload follows its parent's switch.
+
+    :param metadata: Validated session metadata for the upload.
+    :param spec: The uploaded bundle's validated spec.
+    :returns: ``True`` when the new session's ``cost_control_mode_override`` must be ``"on"``.
+    """
+    if metadata.parent_session_id is not None:
+        return False
+    try:
+        return _validated_spec_smart_routing_default(spec)
+    except OmnigentError:
+        # An invalid value is left to the routing create that reports it.
+        return False
+
+
 def _spec_pins_its_brain(
     body: SessionCreateInput,
     agent: Agent,
@@ -14097,6 +14116,9 @@ def _create_session_from_bundle(
         metadata = metadata.model_copy(
             update={"labels": {**(metadata.labels or {}), PINNED_BRAIN_LABEL_KEY: "1"}}
         )
+    bundle_cost_control_mode_override = (
+        "on" if _bundle_spec_starts_routing_on(metadata, spec) else None
+    )
     if metadata.parent_session_id is not None:
         try:
             terminal_launch_args = _derive_terminal_launch_args_from_spec(spec)
@@ -14139,6 +14161,7 @@ def _create_session_from_bundle(
                 inference_snapshot=inference_snapshot,
                 inference_model=inference_model,
                 git_branch=git_branch,
+                cost_control_mode_override=bundle_cost_control_mode_override,
             )
 
     agent_id = generate_agent_id()
@@ -14164,6 +14187,7 @@ def _create_session_from_bundle(
         inference_model=inference_model,
         git_branch=git_branch,
         created_by=created_by,
+        cost_control_mode_override=bundle_cost_control_mode_override,
     )
 
 

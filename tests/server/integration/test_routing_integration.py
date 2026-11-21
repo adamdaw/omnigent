@@ -31,6 +31,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from tests.server.helpers import (
     FakeCaps,
     FakeRoutingClient,
+    build_agent_bundle,
     create_test_agent,
     echo_runner_client,
 )
@@ -1827,6 +1828,33 @@ async def test_a_spec_default_does_not_reach_a_child(
     assert conv is not None
     assert conv.cost_control_mode_override is None
     assert conv.subagent_routing_override is None
+
+
+async def test_an_uploaded_bundle_takes_the_spec_routing_default(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    bundle = build_agent_bundle(
+        name="routing-default-upload",
+        executor={
+            "type": "omnigent",
+            "config": {
+                "harness": "claude-sdk",
+                "smart_routing_harness": "pinned",
+                "smart_routing_default": "on",
+            },
+        },
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code == 201, resp.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(str(resp.json()["session_id"]))
+    assert conv is not None
+    assert conv.cost_control_mode_override == "on"
+    assert conv.labels.get(PINNED_BRAIN_LABEL_KEY) == "1"
 
 
 async def test_an_invalid_spec_routing_default_is_rejected(client: httpx.AsyncClient) -> None:

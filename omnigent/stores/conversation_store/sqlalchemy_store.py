@@ -6455,6 +6455,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         model_override: str | None = None,
+        cost_control_mode_override: str | None = None,
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
@@ -6532,6 +6533,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels=labels,
             reasoning_effort=reasoning_effort,
             model_override=model_override,
+            cost_control_mode_override=cost_control_mode_override,
             workspace=workspace,
             git_branch=git_branch,
             terminal_launch_args=terminal_launch_args,
@@ -6555,6 +6557,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         model_override: str | None = None,
+        cost_control_mode_override: str | None = None,
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
@@ -6575,6 +6578,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             {
                 "reasoning_effort": reasoning_effort,
                 "model_override": model_override,
+                "cost_control_mode_override": cost_control_mode_override,
             }
         )
         encoded_inference_snapshot = (
