@@ -571,7 +571,7 @@ def candidate_models(
     :param harness: Requesting harness id, e.g. ``"codex-native"``.
     :param cross_harness: ``True`` to also offer the counterpart family.
     :param catalog: Live per-session model catalog keyed by worker name
-        (:func:`omnigent.server.smart_routing.fetch_runner_models`). Preferred
+        (:func:`omnigent.server.smart_routing.fetch_runner_models_with_ordering`). Preferred
         over the static table so a model generation the workspace serves today
         isn't treated as unservable; the static table fills any harness the
         catalog has no row for.

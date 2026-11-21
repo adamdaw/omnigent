@@ -339,6 +339,21 @@ def test_build_rubric_shows_harness_names() -> None:
     assert "databricks-gpt-5-4-nano" in rubric
 
 
+def test_ordered_and_mixed_rubrics_preserve_original_examples() -> None:
+    from omnigent.models.model_metadata import ModelIntent
+
+    ordered = _build_rubric({"codex": ["first", "last"]})
+    mixed = _build_rubric({"codex": ["first", "last"], "pi": ["model"]}, {"pi": False})
+    for rubric in (ordered, mixed):
+        assert f"SIMPLE   → {ModelIntent.FAST.value}: first available model" in rubric
+        assert f"MODERATE → {ModelIntent.BALANCED.value}: middle available model" in rubric
+        assert f"COMPLEX  → {ModelIntent.POWERFUL.value}: last available model" in rubric
+        assert "Examples: greetings, quick lookups, one-line fixes, trivial Q&A." in rubric
+        assert (
+            "Examples: multi-file refactors, architecture decisions, security analysis," in rubric
+        )
+
+
 # ── LLMRoutingClient ───────────────────────────────────────────────
 
 
@@ -440,9 +455,7 @@ async def test_unordered_judge_keeps_each_offered_tier(tier: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["picker", "host"])
-async def test_turn_plain_catalog_retains_positional_routing(source: str) -> None:
-    del source
+async def test_turn_plain_catalog_retains_positional_routing() -> None:
     models = ["gpt-6.1-terra", "gpt-6.1-sol", "gpt-5.6-luna"]
     judge = LLMRoutingClient(
         _FakeLLMClient(
@@ -534,6 +547,90 @@ async def test_subagent_tiered_catalog_keeps_positional_routing() -> None:
         gateway_backed=False,
     )
     assert decision.model == models[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["turn", "session"])
+@pytest.mark.parametrize("partial", [False, True])
+async def test_filtered_runner_catalog_tier_order(path: str, partial: bool) -> None:
+    models = ["gpt-6.1-terra", "gpt-6.1-sol"]
+    rows = [
+        {"id": models[0], "cost_tier": "economy"},
+        {"id": models[1], "cost_tier": None if partial else "premium"},
+        {"id": "claude-sonnet-4-6"},
+    ]
+    response = MagicMock()
+    worker = "self" if path == "turn" else "codex"
+    response.json.return_value = {"workers": {worker: {"models": rows}}}
+    runner = MagicMock()
+    runner.get = AsyncMock(return_value=response)
+    harness = "codex-native" if path == "turn" else "codex"
+    judge = LLMRoutingClient(
+        _FakeLLMClient(
+            {
+                "harness": harness,
+                "model": models[0],
+                "rationale": "This is a COMPLEX task (work).",
+            }
+        )
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=judge)):
+        if path == "turn":
+            model, _ = await route_turn(
+                harness, "work", session_id=f"filter-{path}-{partial}", runner_client=runner
+            )
+        else:
+            _, model, _, error = await route_session_harness(
+                "work",
+                session_id=f"filter-{path}-{partial}",
+                runner_client=runner,
+                harness_candidates=[harness],
+            )
+            assert error is None
+    assert model == (models[0] if partial else models[1])
+
+
+@pytest.mark.asyncio
+async def test_advice_unordered_runner_catalog_keeps_judge_pick() -> None:
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions.helpers import _handle_advise_models_mcp
+
+    models = ["gpt-6.1-terra", "gpt-5.6-luna"]
+    response = MagicMock()
+    response.json.return_value = {"workers": {"codex": {"models": [{"id": m} for m in models]}}}
+    runner = MagicMock()
+    runner.get = AsyncMock(return_value=response)
+    judge = LLMRoutingClient(
+        _FakeLLMClient(
+            {
+                "harness": "codex",
+                "model": models[0],
+                "rationale": "This is a COMPLEX task (work).",
+            }
+        )
+    )
+    tasks = {"tasks": [{"task": "work", "agents": [{"agent": "codex"}]}]}
+    with (
+        patch(
+            "omnigent.server.routes._sessions.helpers.get_caps",
+            return_value=FakeCaps(routing_client=judge),
+        ),
+        patch(
+            "omnigent.server.routes._sessions.helpers._get_runner_client",
+            AsyncMock(return_value=runner),
+        ),
+    ):
+        result = await _handle_advise_models_mcp(
+            1,
+            SimpleNamespace(agent_id=None),
+            tasks,
+            None,
+            session_id="advice-unordered",
+            runner_router=object(),
+        )
+    text = json.loads(result.body)["result"]["content"][0]["text"]
+    assert json.loads(text)["recommendations"][0]["model"] == models[0]
 
 
 # A judge whose classification and model field disagree is applied by its

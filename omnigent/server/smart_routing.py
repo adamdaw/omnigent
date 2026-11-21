@@ -33,7 +33,7 @@ from omnigent.models.model_fallbacks import (
     SMART_ROUTING_TASK_V1_CLAUDE_ARMS,
     SMART_ROUTING_TASK_V1_CODEX_ARMS,
 )
-from omnigent.models.model_metadata import ModelCostTier, ModelWireAPI
+from omnigent.models.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -73,7 +73,7 @@ ROUTING_REQUEST_TIMEOUT_S = 9.0
 # ── Model lists per harness family ──────────────────────────────────────────
 #
 # Ordered cheapest → most powerful within each family. Live per-session catalogs
-# win wherever one is in reach (:func:`fetch_runner_models`); this table is the
+# win wherever one is in reach (:func:`fetch_runner_models_with_ordering`); this table is the
 # fallback, so a stale entry pushes a router pick through the substitution path.
 # The ids themselves are owned records in :mod:`omnigent.models.model_fallbacks`.
 
@@ -169,7 +169,7 @@ def catalog_models_for_harness(
     shares the family, then — only for the session's own harness — the
     ``"self"`` row.
 
-    :param catalog: :func:`fetch_runner_models` result, or ``None``.
+    :param catalog: Worker-to-model mapping from runner discovery, or ``None``.
     :param harness: Harness id whose models are wanted, e.g.
         ``"claude-native"``.
     :param allow_self: ``True`` when *harness* is the catalog session's own
@@ -525,10 +525,24 @@ Harness descriptions:
 - pi: Multi-model headless harness; can run both Claude and GPT models;
   best for read-only exploration, review, and cross-vendor verification.
 
-{routing_instructions}
+Each harness list is ordered by provider-relative cost when the catalog reports
+it, with provider catalog order as the tie-breaker. Classify the task using
+stable model intents and choose the corresponding relative position:
 
-The rationale field must follow this pattern:
-  "This is a [SIMPLE/MODERATE/COMPLEX] task ([brief reason]); selected model [model-id]."
+  SIMPLE   → {fast_intent}: first available model
+             Examples: greetings, quick lookups, one-line fixes, trivial Q&A.
+
+  MODERATE → {balanced_intent}: middle available model
+             Examples: single-file edits, debugging a known issue, brief explanations.
+
+  COMPLEX  → {powerful_intent}: last available model
+             Examples: multi-file refactors, architecture decisions, security analysis,
+             long reasoning chains, tasks requiring high accuracy or broad context.
+
+The rationale field must follow this exact pattern so the explanation is consistent
+with the model chosen:
+  "This is a [SIMPLE/MODERATE/COMPLEX] task ([brief reason]); \
+selected [cheapest/mid-range/most capable] model [model-id]."
 
 Return **strict JSON only**:
 {{"harness": "<harness-id>", "model": "<model-id>", "rationale": "<sentence>"}}
@@ -541,31 +555,44 @@ def _build_rubric(
 ) -> str:
     """Format the judge prompt with per-harness ordering information."""
     cost_ordered = cost_ordered or {}
+    unknown = any(not cost_ordered.get(h, True) for h in available_models)
+    ordered = any(cost_ordered.get(h, True) for h in available_models)
     sections = []
     for harness, models in available_models.items():
         model_lines = "\n".join(f"    - {m}" for m in models)
-        ordering = "ordered" if cost_ordered.get(harness, True) else "unknown"
-        sections.append(f"  harness: {harness} (cost ordering: {ordering})\n{model_lines}")
-    if any(not cost_ordered.get(h, True) for h in available_models):
-        instructions = (
+        label = ""
+        if unknown:
+            label = (
+                " (cost ordering: ordered)"
+                if cost_ordered.get(harness, True)
+                else " (cost ordering: unknown)"
+            )
+        sections.append(f"  harness: {harness}{label}\n{model_lines}")
+    template = _JUDGE_SYSTEM_TEMPLATE
+    if unknown:
+        unknown_instructions = (
             "For a harness whose cost ordering is unknown, choose the offered model best "
             "suited to the task. For clearly SIMPLE tasks prefer a smaller or older-generation "
-            "model. Classify each task as SIMPLE, MODERATE, or COMPLEX."
+            "model. Classify each task as SIMPLE, MODERATE, or COMPLEX. "
+            'Use the rationale: "This is a [SIMPLE/MODERATE/COMPLEX] task ([brief reason]); '
+            'selected model [model-id]."\n\n'
         )
-        if any(cost_ordered.get(h, True) for h in available_models):
-            instructions += (
-                " For a harness marked ordered, use first for SIMPLE, middle for MODERATE, "
-                "and last for COMPLEX."
+        start = template.index("Each harness list is ordered")
+        end = template.index("Return **strict JSON only**:", start)
+        if ordered:
+            template = (
+                template[:start]
+                + unknown_instructions
+                + "For ordered harnesses only:\n"
+                + template[start:]
             )
-    else:
-        instructions = (
-            "Classify the task as SIMPLE, MODERATE, or COMPLEX. "
-            "Choose the first model for SIMPLE, a middle model for MODERATE, "
-            "and the last model for COMPLEX."
-        )
-    return _JUDGE_SYSTEM_TEMPLATE.format(
+        else:
+            template = template[:start] + unknown_instructions + template[end:]
+    return template.format(
         harness_menu="\n".join(sections),
-        routing_instructions=instructions,
+        fast_intent=ModelIntent.FAST.value,
+        balanced_intent=ModelIntent.BALANCED.value,
+        powerful_intent=ModelIntent.POWERFUL.value,
     )
 
 
@@ -2351,7 +2378,8 @@ async def route_session_harness(
             harness_models,
             gateway_backed=gateway_backed,
             cost_ordered={
-                h: all(row.cost_tier for row in rows) for h, rows in harness_catalog.items()
+                h: all(row.cost_tier for row in rows if row.id in harness_models[h])
+                for h, rows in harness_catalog.items()
             },
         )
     except Exception as exc:  # routing failures must not block session creation
@@ -2524,16 +2552,18 @@ async def route_turn(
             available = {harness or "self": in_vocabulary}
     if available is None and session_id and runner_client is not None:
         _catalog_fetched = True
-        runner_result = await fetch_runner_models_with_ordering(session_id, runner_client)
-        runner_catalog, runner_ordering = runner_result or ({}, {})
-        if "self" in runner_catalog:
+        runner_catalog = await _fetch_runner_catalog(session_id, runner_client)
+        if runner_catalog and "self" in runner_catalog:
             # A native terminal's own catalog can list models from other
             # families (its gateway serves them all); offering those would
             # route the session onto a model its harness cannot run.
-            in_family = models_in_family(harness, runner_catalog["self"])
+            entries = runner_catalog["self"]
+            in_family = models_in_family(harness, [entry.id for entry in entries])
             if in_family:
                 available = {harness or "self": in_family}
-                cost_ordered[harness or "self"] = runner_ordering["self"]
+                cost_ordered[harness or "self"] = all(
+                    entry.cost_tier for entry in entries if entry.id in in_family
+                )
     if not available:
         # The static table contains Unity Catalog model-service ids, so off the
         # gateway it names models this pane cannot be switched to. Decline the
