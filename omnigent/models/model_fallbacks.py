@@ -64,7 +64,7 @@ PI_ANTHROPIC_BUDGET_THINKING = StaticModelFallback(
 # ── Smart Routing ───────────────────────────────────────────────────────────
 #
 # The router's static tables. A live per-session catalog wins wherever one is
-# in reach (``omnigent.server.smart_routing.fetch_runner_models``) and a
+# in reach (``omnigent.server.smart_routing.fetch_runner_models_with_ordering``) and a
 # deployment's ``routing.*`` settings override each table wholesale; these are
 # what a router that can reach neither falls back to.
 

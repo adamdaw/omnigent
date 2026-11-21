@@ -73,7 +73,7 @@ ROUTING_REQUEST_TIMEOUT_S = 9.0
 # ── Model lists per harness family ──────────────────────────────────────────
 #
 # Ordered cheapest → most powerful within each family. Live per-session catalogs
-# win wherever one is in reach (:func:`fetch_runner_models`); this table is the
+# win wherever one is in reach (:func:`fetch_runner_models_with_ordering`); this table is the
 # fallback, so a stale entry pushes a router pick through the substitution path.
 # The ids themselves are owned records in :mod:`omnigent.models.model_fallbacks`.
 
@@ -169,7 +169,7 @@ def catalog_models_for_harness(
     shares the family, then — only for the session's own harness — the
     ``"self"`` row.
 
-    :param catalog: :func:`fetch_runner_models` result, or ``None``.
+    :param catalog: Worker-to-model mapping from runner discovery, or ``None``.
     :param harness: Harness id whose models are wanted, e.g.
         ``"claude-native"``.
     :param allow_self: ``True`` when *harness* is the catalog session's own
@@ -177,27 +177,34 @@ def catalog_models_for_harness(
     :returns: Servable model ids, or ``None`` when the catalog has no row
         for this harness.
     """
+    worker = catalog_worker_for_harness(catalog, harness, allow_self=allow_self)
+    return list(catalog[worker]) if catalog and worker is not None else None
+
+
+def catalog_worker_for_harness(
+    catalog: Mapping[str, list[str]] | None,
+    harness: str,
+    *,
+    allow_self: bool = False,
+) -> str | None:
+    """Find the worker row selected for a harness."""
     if not catalog:
         return None
-    own = catalog.get(harness)
-    if own:
-        return list(own)
+    if catalog.get(harness):
+        return harness
     family = _HARNESS_FAMILY.get(harness)
-    for worker, worker_models in catalog.items():
-        if not worker_models:
-            continue
+    for worker, models in catalog.items():
         worker_harness = _WORKER_NAME_TO_HARNESS.get(worker)
-        if worker_harness is None:
-            continue
-        if worker_harness == harness or (
-            family is not None and _HARNESS_FAMILY.get(worker_harness) == family
+        if (
+            models
+            and worker_harness is not None
+            and (
+                worker_harness == harness
+                or (family is not None and _HARNESS_FAMILY.get(worker_harness) == family)
+            )
         ):
-            return list(worker_models)
-    if allow_self:
-        own_models = catalog.get("self")
-        if own_models:
-            return list(own_models)
-    return None
+            return worker
+    return "self" if allow_self and catalog.get("self") else None
 
 
 def failure_detail(exc: BaseException) -> str:
@@ -469,6 +476,20 @@ async def fetch_runner_models(
     return {worker: [model.id for model in models] for worker, models in catalog.items()}
 
 
+async def fetch_runner_models_with_ordering(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+) -> tuple[dict[str, list[str]], dict[str, bool]] | None:
+    """Return runner candidates and whether each complete row has cost tiers."""
+    catalog = await _fetch_runner_catalog(session_id, runner_client)
+    if catalog is None:
+        return None
+    return (
+        {worker: [model.id for model in models] for worker, models in catalog.items()},
+        {worker: all(model.cost_tier for model in models) for worker, models in catalog.items()},
+    )
+
+
 def _flatten_models(available_models: dict[str, list[str]]) -> list[str]:
     """Return a deduped, ordered flat model list from a harness → models map.
 
@@ -528,13 +549,46 @@ Return **strict JSON only**:
 """
 
 
-def _build_rubric(available_models: dict[str, list[str]]) -> str:
-    """Format the judge prompt with the harness → models structure."""
-    sections: list[str] = []
+def _build_rubric(
+    available_models: dict[str, list[str]],
+    cost_ordered: Mapping[str, bool] | None = None,
+) -> str:
+    """Format the judge prompt with per-harness ordering information."""
+    cost_ordered = cost_ordered or {}
+    unknown = any(not cost_ordered.get(h, True) for h in available_models)
+    ordered = any(cost_ordered.get(h, True) for h in available_models)
+    sections = []
     for harness, models in available_models.items():
         model_lines = "\n".join(f"    - {m}" for m in models)
-        sections.append(f"  harness: {harness}\n{model_lines}")
-    return _JUDGE_SYSTEM_TEMPLATE.format(
+        label = ""
+        if unknown:
+            label = (
+                " (cost ordering: ordered)"
+                if cost_ordered.get(harness, True)
+                else " (cost ordering: unknown)"
+            )
+        sections.append(f"  harness: {harness}{label}\n{model_lines}")
+    template = _JUDGE_SYSTEM_TEMPLATE
+    if unknown:
+        unknown_instructions = (
+            "For a harness whose cost ordering is unknown, choose the offered model best "
+            "suited to the task. For clearly SIMPLE tasks prefer a smaller or older-generation "
+            "model. Classify each task as SIMPLE, MODERATE, or COMPLEX. "
+            'Use the rationale: "This is a [SIMPLE/MODERATE/COMPLEX] task ([brief reason]); '
+            'selected model [model-id]."\n\n'
+        )
+        start = template.index("Each harness list is ordered")
+        end = template.index("Return **strict JSON only**:", start)
+        if ordered:
+            template = (
+                template[:start]
+                + unknown_instructions
+                + "For ordered harnesses only:\n"
+                + template[start:]
+            )
+        else:
+            template = template[:start] + unknown_instructions + template[end:]
+    return template.format(
         harness_menu="\n".join(sections),
         fast_intent=ModelIntent.FAST.value,
         balanced_intent=ModelIntent.BALANCED.value,
@@ -545,20 +599,21 @@ def _build_rubric(available_models: dict[str, list[str]]) -> str:
 _STATED_TIER = re.compile(r"This is an? (SIMPLE|MODERATE|COMPLEX) task\b")
 
 
-def _reconcile_with_stated_tier(model: str, rationale: str, models: list[str]) -> str:
+def _reconcile_with_stated_tier(
+    model: str, rationale: str, models: list[str], *, cost_ordered: bool = True
+) -> str:
     """Apply the list position the judge's own classification names.
 
-    A small judge can classify a task COMPLEX ("most capable model") yet put
-    a cheaper id in its ``model`` field. The rubric defines each class by
-    position, so the class decides; a verdict with no class keeps its model.
+    When cost ordering is known, the class determines the list position.
+    Otherwise, preserve the offered model named by the judge.
 
     :param model: The verdict's model, already known to be in *models*.
     :param rationale: The verdict's rationale, e.g. ``"This is a COMPLEX task (...)"``.
-    :param models: The chosen harness's models, cheapest first.
+    :param models: The chosen harness's candidate models.
     :returns: *model*, or the model at the position its stated class names.
     """
     match = _STATED_TIER.match(rationale.lstrip())
-    if match is None or model not in models:
+    if match is None or model not in models or not cost_ordered:
         return model
     tier = match.group(1)
     position = models.index(model)
@@ -614,11 +669,13 @@ class LLMRoutingClient:
         self,
         message: str,
         available_models: dict[str, list[str]],
+        *,
+        cost_ordered: Mapping[str, bool] | None = None,
     ) -> RoutingResult | None:
         import asyncio
 
         flat = _flatten_models(available_models)
-        rubric = _build_rubric(available_models)
+        rubric = _build_rubric(available_models, cost_ordered)
         _logger.info(
             "LLMRoutingClient: available_models=%s prompt_chars=%d",
             dict(available_models),
@@ -707,7 +764,10 @@ class LLMRoutingClient:
 
         if model_is_candidate and chosen_harness is not None:
             model = _reconcile_with_stated_tier(
-                model, str(rationale), available_models[chosen_harness]
+                model,
+                str(rationale),
+                available_models[chosen_harness],
+                cost_ordered=(cost_ordered or {}).get(chosen_harness, True),
             )
         return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
 
@@ -2313,7 +2373,14 @@ async def route_session_harness(
 
     try:
         call = await route_with_fallback(
-            backends, user_message, harness_models, gateway_backed=gateway_backed
+            backends,
+            user_message,
+            harness_models,
+            gateway_backed=gateway_backed,
+            cost_ordered={
+                h: all(row.cost_tier for row in rows if row.id in harness_models[h])
+                for h, rows in harness_catalog.items()
+            },
         )
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
@@ -2478,20 +2545,25 @@ async def route_turn(
     # workers' models are not this session's. Key the map by harness id, not the
     # "self" label, so the seam infers the right single-harness scenario.
     available: dict[str, list[str]] | None = None
+    cost_ordered: dict[str, bool] = {}
     if catalog:
         in_vocabulary = models_in_family(harness, catalog)
         if in_vocabulary:
             available = {harness or "self": in_vocabulary}
     if available is None and session_id and runner_client is not None:
         _catalog_fetched = True
-        runner_catalog = await fetch_runner_models(session_id, runner_client)
+        runner_catalog = await _fetch_runner_catalog(session_id, runner_client)
         if runner_catalog and "self" in runner_catalog:
             # A native terminal's own catalog can list models from other
             # families (its gateway serves them all); offering those would
             # route the session onto a model its harness cannot run.
-            in_family = models_in_family(harness, runner_catalog["self"])
+            entries = runner_catalog["self"]
+            in_family = models_in_family(harness, [entry.id for entry in entries])
             if in_family:
                 available = {harness or "self": in_family}
+                cost_ordered[harness or "self"] = all(
+                    entry.cost_tier for entry in entries if entry.id in in_family
+                )
     if not available:
         # The static table contains Unity Catalog model-service ids, so off the
         # gateway it names models this pane cannot be switched to. Decline the
@@ -2533,7 +2605,11 @@ async def route_turn(
     _prep_s = time.monotonic() - _prep_started
     _route_started = time.monotonic()
     call = await route_with_fallback(
-        backends, user_message, available, gateway_backed=gateway_backed
+        backends,
+        user_message,
+        available,
+        gateway_backed=gateway_backed,
+        cost_ordered=cost_ordered,
     )
     _logger.info(
         "smart_routing: session=%s prep=%.3fs router=%.3fs catalog_fetch=%s candidates=%d",

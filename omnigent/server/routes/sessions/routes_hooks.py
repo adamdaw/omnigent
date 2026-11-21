@@ -1778,7 +1778,9 @@ def register_hooks_routes(
             media_type="application/json",
         )
 
-    async def _route_subagent_catalog(session_id: str) -> dict[str, list[str]] | None:
+    async def _route_subagent_catalog(
+        session_id: str,
+    ) -> tuple[dict[str, list[str]], dict[str, bool]] | None:
         """
         Fetch the session's live model catalog for subagent routing.
 
@@ -1786,7 +1788,7 @@ def register_hooks_routes(
         :returns: Worker → servable model ids, or ``None`` when the runner
             is unreachable (callers fall back to the static table).
         """
-        from omnigent.server.smart_routing import fetch_runner_models
+        from omnigent.server.smart_routing import fetch_runner_models_with_ordering
 
         try:
             runner_client = await _get_runner_client(
@@ -1794,7 +1796,7 @@ def register_hooks_routes(
             )
             if runner_client is None:
                 return None
-            return await fetch_runner_models(session_id, runner_client)
+            return await fetch_runner_models_with_ordering(session_id, runner_client)
         except Exception:
             _logger.debug(
                 "route-subagent: live catalog unavailable for session=%s",
@@ -1921,12 +1923,14 @@ def register_hooks_routes(
         # Offer the live catalog: the static table lags model generations, and
         # a pick the workspace serves must not look unservable and get
         # substituted down a tier.
-        catalog = await _route_subagent_catalog(session_id)
+        catalog_result = await _route_subagent_catalog(session_id)
+        catalog, catalog_ordering = catalog_result or (None, None)
         decision = await resolve_subagent_route(
             session_id,
             route_request,
             caps=get_caps(),
             catalog=catalog,
+            catalog_ordering=catalog_ordering,
             cross_harness=cross_harness,
             gateway_backed=gateway_backed,
             allow_static_fallback=gateway_backed,

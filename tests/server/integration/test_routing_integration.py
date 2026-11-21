@@ -650,13 +650,15 @@ async def test_codex_session_keeps_glm_candidates_and_applies_a_glm_pick(
     async def _fake_runner_client(*_args: Any, **_kwargs: Any) -> Any:
         return object()
 
-    async def _fake_fetch(*_args: Any, **_kwargs: Any) -> dict[str, list[str]]:
-        return live_catalog
+    async def _fake_fetch(
+        *_args: Any, **_kwargs: Any
+    ) -> tuple[dict[str, list[str]], dict[str, bool]]:
+        return live_catalog, {"self": True}
 
     with (
         patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)),
         patch.object(sessions_facade, "_get_runner_client", _fake_runner_client),
-        patch.object(smart_routing_module, "fetch_runner_models", _fake_fetch),
+        patch.object(smart_routing_module, "fetch_runner_models_with_ordering", _fake_fetch),
     ):
         resp = await client.post(
             f"/v1/sessions/{session_id}/hooks/route-subagent",

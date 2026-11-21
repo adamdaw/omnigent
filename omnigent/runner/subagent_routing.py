@@ -571,7 +571,7 @@ def candidate_models(
     :param harness: Requesting harness id, e.g. ``"codex-native"``.
     :param cross_harness: ``True`` to also offer the counterpart family.
     :param catalog: Live per-session model catalog keyed by worker name
-        (:func:`omnigent.server.smart_routing.fetch_runner_models`). Preferred
+        (:func:`omnigent.server.smart_routing.fetch_runner_models_with_ordering`). Preferred
         over the static table so a model generation the workspace serves today
         isn't treated as unservable; the static table fills any harness the
         catalog has no row for.
@@ -690,6 +690,7 @@ async def resolve_subagent_route(
     caps: Any = None,
     available_models: dict[str, list[str]] | None = None,
     catalog: Mapping[str, list[str]] | None = None,
+    catalog_ordering: Mapping[str, bool] | None = None,
     cross_harness: bool = False,
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
@@ -731,6 +732,7 @@ async def resolve_subagent_route(
         available_models,
         catalog,
         cross_harness,
+        catalog_ordering=catalog_ordering,
         gateway_backed=gateway_backed,
         allow_static_fallback=allow_static_fallback,
     )
@@ -750,6 +752,7 @@ async def _decide(
     catalog: Mapping[str, list[str]] | None,
     cross_harness: bool,
     *,
+    catalog_ordering: Mapping[str, bool] | None = None,
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
 ) -> SubagentRouteDecision:
@@ -802,8 +805,20 @@ async def _decide(
     client: Any = backends.any()  # type: ignore[explicit-any]
     source: str | None = None
     result = None
+    from omnigent.server.smart_routing import catalog_worker_for_harness
+
+    ordering: dict[str, bool] = {}
+    if available_models is None and catalog_ordering:
+        for candidate in candidates:
+            worker = catalog_worker_for_harness(
+                catalog, candidate, allow_self=candidate == req.harness
+            )
+            if worker is not None:
+                ordering[candidate] = catalog_ordering.get(worker, True)
     try:
-        call = await route_with_fallback(backends, task, candidates, gateway_backed=gateway_backed)
+        call = await route_with_fallback(
+            backends, task, candidates, gateway_backed=gateway_backed, cost_ordered=ordering
+        )
     except Exception as exc:  # router outages are a normal path here
         _logger.warning(
             "route-subagent: router call failed for session=%s", session_id, exc_info=True

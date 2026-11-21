@@ -12213,17 +12213,24 @@ async def _handle_advise_models_mcp(
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.models.model_catalog import spec_harness
-    from omnigent.server.smart_routing import _WORKER_NAME_TO_HARNESS, fetch_runner_models
+    from omnigent.server.smart_routing import (
+        _WORKER_NAME_TO_HARNESS,
+        LLMRoutingClient,
+        fetch_runner_models_with_ordering,
+    )
 
     # Fetch live model catalog from the runner once; used below to populate
     # per-agent model lists when the caller omits explicit models.
     # Keys are worker names ("self", "claude_code", etc.) as returned by
     # catalog_for_spec. None when runner discovery is unavailable.
     _runner_catalog: dict[str, list[str]] | None = None
+    _runner_ordering: dict[str, bool] = {}
     if session_id is not None and runner_router is not None:
         _runner_client = await _get_runner_client(session_id, runner_router)
         if _runner_client is not None:
-            _runner_catalog = await fetch_runner_models(session_id, _runner_client)
+            catalog_result = await fetch_runner_models_with_ordering(session_id, _runner_client)
+            if catalog_result is not None:
+                _runner_catalog, _runner_ordering = catalog_result
 
     # Resolve the parent agent spec to look up sub-agent harnesses.
     spec: Any | None = None
@@ -12275,6 +12282,7 @@ async def _handle_advise_models_mcp(
         model_to_agent: dict[str, str] = {}
         harness_to_agent: dict[str, str] = {}
         harness_models: dict[str, list[str]] = {}
+        harness_ordering: dict[str, bool] = {}
         for agent_entry in agents_spec:
             if not isinstance(agent_entry, dict):
                 continue
@@ -12282,19 +12290,21 @@ async def _handle_advise_models_mcp(
             explicit_models: list[str] | None = agent_entry.get("models")
             if explicit_models is not None and not isinstance(explicit_models, list):
                 explicit_models = None
+            worker_ordered = True
             if explicit_models:
                 harness_key = agent  # use agent name as key when models are explicit
                 candidates = explicit_models
             else:
                 harness_key = _resolve_harness_for_worker(agent) or agent
                 # Prefer the worker name, then its normalized harness key.
-                candidates = (
-                    (_runner_catalog or {}).get(agent)
-                    or (_runner_catalog or {}).get(harness_key)
-                    or []
-                )
+                worker = agent if (_runner_catalog or {}).get(agent) else harness_key
+                candidates = (_runner_catalog or {}).get(worker) or []
+                worker_ordered = _runner_ordering.get(worker, True)
             if candidates:
                 harness_models.setdefault(harness_key, [])
+                harness_ordering[harness_key] = (
+                    harness_ordering.get(harness_key, True) and worker_ordered
+                )
                 harness_to_agent.setdefault(harness_key, agent)
                 for m in candidates:
                     if m not in model_to_agent:
@@ -12315,8 +12325,13 @@ async def _handle_advise_models_mcp(
                     gateway_backed=gateway_backs_all(
                         conv, (_resolve_harness_for_worker(h) or h for h in harness_models)
                     ),
+                    cost_ordered=harness_ordering,
                 )
                 verdict = call.result if call else None
+            elif isinstance(routing_client, LLMRoutingClient):
+                verdict = await routing_client.route(
+                    task_text, harness_models, cost_ordered=harness_ordering
+                )
             else:
                 verdict = await routing_client.route(task_text, harness_models)
         except Exception:  # noqa: BLE001  # routing failures must not crash the advisor
