@@ -425,9 +425,10 @@ async def test_judge_preserves_unordered_catalog_verdict(named: str, expected: s
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tier", ["SIMPLE", "MODERATE", "COMPLEX"])
 async def test_unordered_judge_keeps_each_offered_tier(tier: str) -> None:
+    named = "gpt-6.1-sol" if tier == "SIMPLE" else "gpt-6.1-terra"
     verdict = {
         "harness": "codex-native",
-        "model": "gpt-6.1-terra",
+        "model": named,
         "rationale": f"This is a {tier} task (work).",
     }
     result = await LLMRoutingClient(_FakeLLMClient(verdict)).route(
@@ -435,7 +436,7 @@ async def test_unordered_judge_keeps_each_offered_tier(tier: str) -> None:
         {"codex-native": ["gpt-6.1-terra", "gpt-6.1-sol", "gpt-5.6-luna"]},
         cost_ordered={"codex-native": False},
     )
-    assert result is not None and result.model == "gpt-6.1-terra"
+    assert result is not None and result.model == named
 
 
 @pytest.mark.asyncio
