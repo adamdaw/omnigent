@@ -136,7 +136,26 @@ def infer_models(
     if curated is None:
         return None
     arms = current_generation_models(current_generation)
-    return [*curated, *arms.get(family, ())]
+    models = [*curated, *arms.get(family, ())]
+    return _CatalogModels(models, tiered_ids=models)
+
+
+class _CatalogModels(list[str]):
+    """Candidate IDs with their catalog's cost-ordering availability."""
+
+    def __init__(self, models: Iterable[str], *, tiered_ids: Iterable[str]) -> None:
+        super().__init__(models)
+        self.tiered_ids = frozenset(tiered_ids)
+
+    @property
+    def cost_ordered(self) -> bool:
+        return any(model in self.tiered_ids for model in self)
+
+
+def _preserve_model_ordering(source: Iterable[str], models: Iterable[str]) -> list[str]:
+    if isinstance(source, _CatalogModels):
+        return _CatalogModels(models, tiered_ids=source.tiered_ids)
+    return list(models)
 
 
 def models_in_family(harness: str | None, models: Iterable[str]) -> list[str]:
@@ -152,8 +171,10 @@ def models_in_family(harness: str | None, models: Iterable[str]) -> list[str]:
 
     family = harness_family(harness)
     if family is None:
-        return list(models)
-    return [model for model in models if model_in_family(family, model)]
+        return _preserve_model_ordering(models, models)
+    return _preserve_model_ordering(
+        models, (model for model in models if model_in_family(family, model))
+    )
 
 
 def catalog_models_for_harness(
@@ -181,7 +202,7 @@ def catalog_models_for_harness(
         return None
     own = catalog.get(harness)
     if own:
-        return list(own)
+        return _preserve_model_ordering(own, own)
     family = _HARNESS_FAMILY.get(harness)
     for worker, worker_models in catalog.items():
         if not worker_models:
@@ -192,11 +213,11 @@ def catalog_models_for_harness(
         if worker_harness == harness or (
             family is not None and _HARNESS_FAMILY.get(worker_harness) == family
         ):
-            return list(worker_models)
+            return _preserve_model_ordering(worker_models, worker_models)
     if allow_self:
         own_models = catalog.get("self")
         if own_models:
-            return list(own_models)
+            return _preserve_model_ordering(own_models, own_models)
     return None
 
 
@@ -466,7 +487,13 @@ async def fetch_runner_models(
     catalog = await _fetch_runner_catalog(session_id, runner_client)
     if catalog is None:
         return None
-    return {worker: [model.id for model in models] for worker, models in catalog.items()}
+    return {
+        worker: _CatalogModels(
+            (model.id for model in models),
+            tiered_ids=(model.id for model in models if model.cost_tier),
+        )
+        for worker, models in catalog.items()
+    }
 
 
 def _flatten_models(available_models: dict[str, list[str]]) -> list[str]:
@@ -505,8 +532,9 @@ Harness descriptions:
   best for read-only exploration, review, and cross-vendor verification.
 
 Each harness list is ordered by provider-relative cost when the catalog reports
-it, with provider catalog order as the tie-breaker. Classify the task using
-stable model intents and choose the corresponding relative position:
+it, with provider catalog order as the tie-breaker. When cost ordering is unknown,
+choose the offered model best suited to the task instead of relying on position.
+When cost ordering is known, classify the task using these relative positions:
 
   SIMPLE   → {fast_intent}: first available model
              Examples: greetings, quick lookups, one-line fixes, trivial Q&A.
@@ -533,7 +561,12 @@ def _build_rubric(available_models: dict[str, list[str]]) -> str:
     sections: list[str] = []
     for harness, models in available_models.items():
         model_lines = "\n".join(f"    - {m}" for m in models)
-        sections.append(f"  harness: {harness}\n{model_lines}")
+        ordering = (
+            "unknown"
+            if not isinstance(models, _CatalogModels) or not models.cost_ordered
+            else "available"
+        )
+        sections.append(f"  harness: {harness} (cost ordering: {ordering})\n{model_lines}")
     return _JUDGE_SYSTEM_TEMPLATE.format(
         harness_menu="\n".join(sections),
         fast_intent=ModelIntent.FAST.value,
@@ -548,17 +581,21 @@ _STATED_TIER = re.compile(r"This is an? (SIMPLE|MODERATE|COMPLEX) task\b")
 def _reconcile_with_stated_tier(model: str, rationale: str, models: list[str]) -> str:
     """Apply the list position the judge's own classification names.
 
-    A small judge can classify a task COMPLEX ("most capable model") yet put
-    a cheaper id in its ``model`` field. The rubric defines each class by
-    position, so the class decides; a verdict with no class keeps its model.
+    When cost ordering is known, the class determines the list position.
+    Otherwise, preserve the offered model named by the judge.
 
     :param model: The verdict's model, already known to be in *models*.
     :param rationale: The verdict's rationale, e.g. ``"This is a COMPLEX task (...)"``.
-    :param models: The chosen harness's models, cheapest first.
+    :param models: The chosen harness's candidate models.
     :returns: *model*, or the model at the position its stated class names.
     """
     match = _STATED_TIER.match(rationale.lstrip())
-    if match is None or model not in models:
+    if (
+        match is None
+        or model not in models
+        or not isinstance(models, _CatalogModels)
+        or not models.cost_ordered
+    ):
         return model
     tier = match.group(1)
     position = models.index(model)
@@ -2274,7 +2311,13 @@ async def route_session_harness(
             harness = _WORKER_NAME_TO_HARNESS.get(worker_name)
             if harness is None or harness not in candidate_harnesses:
                 continue
-            in_family = models_in_family(harness, [entry.id for entry in worker_catalog])
+            in_family = models_in_family(
+                harness,
+                _CatalogModels(
+                    (entry.id for entry in worker_catalog),
+                    tiered_ids=(entry.id for entry in worker_catalog if entry.cost_tier),
+                ),
+            )
             if in_family:
                 # First worker wins for a given harness id (dedupe). The catalog
                 # rows are kept alongside the ids so the post-verdict wire check
@@ -2516,9 +2559,10 @@ async def route_turn(
             name: runnable
             for name, models in available.items()
             if (
-                runnable := [
-                    m for m in models if not harness_bars_model(harness, m, prefixes=prefixes)
-                ]
+                runnable := _preserve_model_ordering(
+                    models,
+                    (m for m in models if not harness_bars_model(harness, m, prefixes=prefixes)),
+                )
             )
         }
         if not available:

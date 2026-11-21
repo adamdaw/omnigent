@@ -389,6 +389,40 @@ async def test_llm_routing_client_clamps_hallucinated_model(rationale: str) -> N
     assert result.model == models[0]  # clamped to cheapest
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "named,expected", [("gpt-6.1-terra", "gpt-6.1-terra"), ("missing", "gpt-6.1-terra")]
+)
+async def test_judge_preserves_unordered_catalog_verdict(named: str, expected: str) -> None:
+    from omnigent.server.smart_routing import _CatalogModels
+
+    models = _CatalogModels(
+        [
+            "gpt-6.1-terra",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ],
+        tiered_ids=(),
+    )
+    verdict = {
+        "harness": "codex-native",
+        "model": named,
+        "rationale": "This is a COMPLEX task (concurrency).",
+    }
+    result = await LLMRoutingClient(_FakeLLMClient(verdict)).route(
+        "design a lock-free concurrent hash map and prove it linearizable",
+        {"codex-native": models},
+    )
+    assert result is not None
+    assert result.model == expected
+    assert "cost ordering: unknown" in _build_rubric({"codex-native": models})
+
+
 # A judge whose classification and model field disagree is applied by its
 # classification: the rubric defines each class by list position.
 @pytest.mark.asyncio
@@ -411,7 +445,12 @@ async def test_llm_routing_client_applies_the_stated_tier(
 ) -> None:
     verdict = {"harness": "claude-native", "model": verdict_model, "rationale": rationale}
     client = LLMRoutingClient(_FakeLLMClient(verdict))
-    result = await client.route("task", {"claude-native": ["haiku", "sonnet", "opus"]})
+    from omnigent.server.smart_routing import _CatalogModels
+
+    models = ["haiku", "sonnet", "opus"]
+    result = await client.route(
+        "task", {"claude-native": _CatalogModels(models, tiered_ids=models)}
+    )
     assert result is not None
     assert result.model == expect_model
     assert result.rationale == rationale
@@ -436,8 +475,10 @@ async def test_llm_routing_client_moderate_preserves_an_available_middle_model(
         "model": verdict_model,
         "rationale": "This is a MODERATE task (one file).",
     }
+    from omnigent.server.smart_routing import _CatalogModels
+
     result = await LLMRoutingClient(_FakeLLMClient(verdict)).route(
-        "task", {"claude-native": models}
+        "task", {"claude-native": _CatalogModels(models, tiered_ids=models)}
     )
     assert result is not None
     assert result.model == expect_model
@@ -453,9 +494,12 @@ async def test_llm_routing_client_reconciles_within_resolved_harness(
         "model": "sonnet",
         "rationale": "This is a COMPLEX task (refactor); selected most capable model opus.",
     }
+    from omnigent.server.smart_routing import _CatalogModels
+
+    claude = ["haiku", "sonnet", "opus"]
     result = await LLMRoutingClient(_FakeLLMClient(verdict)).route(
         "task",
-        {"codex": ["nano", "gpt"], "claude-native": ["haiku", "sonnet", "opus"]},
+        {"codex": ["nano", "gpt"], "claude-native": _CatalogModels(claude, tiered_ids=claude)},
     )
     assert result is not None
     assert (result.harness, result.model) == ("claude-native", "opus")
@@ -687,6 +731,41 @@ async def test_route_turn_uses_runner_catalog_when_available() -> None:
     mock_client.get.assert_called_once()
     call_url = mock_client.get.call_args[0][0]
     assert "conv_123" in call_url and "models" in call_url
+
+
+@pytest.mark.asyncio
+async def test_route_turn_preserves_judge_model_from_unordered_catalog() -> None:
+    models = [
+        "gpt-6.1-terra",
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+    response = MagicMock()
+    response.json.return_value = {"workers": {"self": {"models": [{"id": m} for m in models]}}}
+    runner = MagicMock()
+    runner.get = AsyncMock(return_value=response)
+    judge = LLMRoutingClient(
+        _FakeLLMClient(
+            {
+                "harness": "codex-native",
+                "model": models[0],
+                "rationale": "This is a COMPLEX task (concurrency).",
+            }
+        )
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=judge)):
+        model, _ = await route_turn(
+            "codex-native",
+            "design a lock-free concurrent hash map and prove it linearizable",
+            session_id="conv_unordered_judge",
+            runner_client=runner,
+        )
+    assert model == models[0]
 
 
 @pytest.mark.asyncio

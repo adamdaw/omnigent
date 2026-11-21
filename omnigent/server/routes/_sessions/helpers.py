@@ -12213,7 +12213,11 @@ async def _handle_advise_models_mcp(
         return _mcp_tool_result(rpc_id, json.dumps({"router_on": False, "recommendations": []}))
 
     from omnigent.models.model_catalog import spec_harness
-    from omnigent.server.smart_routing import _WORKER_NAME_TO_HARNESS, fetch_runner_models
+    from omnigent.server.smart_routing import (
+        _WORKER_NAME_TO_HARNESS,
+        _preserve_model_ordering,
+        fetch_runner_models,
+    )
 
     # Fetch live model catalog from the runner once; used below to populate
     # per-agent model lists when the caller omits explicit models.
@@ -12294,7 +12298,7 @@ async def _handle_advise_models_mcp(
                     or []
                 )
             if candidates:
-                harness_models.setdefault(harness_key, [])
+                harness_models.setdefault(harness_key, _preserve_model_ordering(candidates, ()))
                 harness_to_agent.setdefault(harness_key, agent)
                 for m in candidates:
                     if m not in model_to_agent:
