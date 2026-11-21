@@ -12215,7 +12215,7 @@ async def _handle_advise_models_mcp(
     from omnigent.models.model_catalog import spec_harness
     from omnigent.server.smart_routing import (
         _WORKER_NAME_TO_HARNESS,
-        _preserve_model_ordering,
+        _CatalogModels,
         fetch_runner_models,
     )
 
@@ -12298,7 +12298,10 @@ async def _handle_advise_models_mcp(
                     or []
                 )
             if candidates:
-                harness_models.setdefault(harness_key, _preserve_model_ordering(candidates, ()))
+                existing = harness_models.get(harness_key, [])
+                tiered_ids = set(getattr(existing, "tiered_ids", ()))
+                tiered_ids.update(getattr(candidates, "tiered_ids", ()))
+                harness_models[harness_key] = _CatalogModels(existing, tiered_ids=tiered_ids)
                 harness_to_agent.setdefault(harness_key, agent)
                 for m in candidates:
                     if m not in model_to_agent:
