@@ -251,7 +251,14 @@ async def test_the_router_source_reaches_the_transcript_item_and_the_sse(
     # Classified as the external client by type, so a gateway-backed route is
     # stamped "databricks-aigw" rather than the judge's source.
     external = ExternalRoutingClient(base_url="https://ws.example.invalid", router_name="task_v1")
-    external.route = routing_client.route  # type: ignore[method-assign]
+
+    async def route_for_gateway(
+        message: str, available_models: dict[str, list[str]], *, gateway_backed: bool
+    ) -> RoutingResult | None:
+        assert gateway_backed
+        return await routing_client.route(message, available_models)
+
+    external.route_for_gateway = route_for_gateway  # type: ignore[method-assign]
     caps = FakeCaps(routing_client=external, routing_backends=RoutingBackends(external=external))
     body = SessionEventInput(
         type="message",
