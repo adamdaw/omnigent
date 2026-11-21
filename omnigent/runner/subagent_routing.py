@@ -127,6 +127,10 @@ PINNED_BRAIN_LABEL_KEY = "omnigent.routing.pinned_brain"
 #: bundle declares, running on that worker's declared harness.
 PINNED_BRAIN_WORKER_LABEL_KEY = "omnigent.routing.pinned_brain_worker"
 
+#: Labels that grant a Smart Routing privilege. Only the server stamps them at
+#: create, after its checks; a spec seed or policy write must never set them.
+ROUTING_PRIVILEGE_LABEL_KEYS = frozenset({PINNED_BRAIN_LABEL_KEY, PINNED_BRAIN_WORKER_LABEL_KEY})
+
 _SCOPE = "native_subagent"
 _PROMPT_CAP = 4000
 #: Task label scored for a codex spawn that carries no prompt and no

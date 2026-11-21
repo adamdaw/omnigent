@@ -15,6 +15,11 @@ writes still land atomically.
 
 from __future__ import annotations
 
+from omnigent.runner.subagent_routing import (
+    PINNED_BRAIN_LABEL_KEY,
+    PINNED_BRAIN_WORKER_LABEL_KEY,
+)
+from omnigent.runtime.policies.builder import _seed_and_load_labels
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import LabelDef
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -121,3 +126,39 @@ def test_apply_label_writes_values_only_free_transitions(
     # Out-of-enum still rejected.
     engine.apply_label_writes({"role": "root"})
     assert engine.labels["role"] == "guest"
+
+
+# ── Smart Routing privilege labels ────────────────────
+
+
+def test_apply_label_writes_drops_routing_privilege_keys(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A policy write cannot grant a Smart Routing privilege: only
+    the server stamps the pinned-brain labels, after its checks."""
+    engine = _build_engine_with_defs(conversation_store, {})
+    engine.apply_label_writes(
+        {
+            PINNED_BRAIN_LABEL_KEY: "1",
+            PINNED_BRAIN_WORKER_LABEL_KEY: "parent-session",
+            "other": "x",
+        }
+    )
+    assert engine.labels == {"other": "x"}
+
+
+def test_seed_skips_routing_privilege_keys_with_declared_initial(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A spec that declares a privilege label with an initial value
+    must not seed it; other declared initials still seed."""
+    conv = conversation_store.create_conversation()
+    seeded = _seed_and_load_labels(
+        conversation_id=conv.id,
+        label_defs={
+            PINNED_BRAIN_LABEL_KEY: LabelDef(initial="1"),
+            "other": LabelDef(initial="x"),
+        },
+        conversation_store=conversation_store,
+    )
+    assert seeded == {"other": "x"}

@@ -21,6 +21,7 @@ from omnigent.policies.base import Policy
 from omnigent.policies.function import FunctionPolicy
 from omnigent.policies.schema import AUTOMATIC_RUNTIME_STATE_KEYS, is_reserved_state_key
 from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.runner.subagent_routing import ROUTING_PRIVILEGE_LABEL_KEYS
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     LabelDef,
@@ -971,6 +972,8 @@ class PolicyEngine:
         """
         result: dict[str, str] = {}
         for key, value in set_labels.items():
+            if key in ROUTING_PRIVILEGE_LABEL_KEYS:
+                continue
             ldef = self.label_defs.get(key)
             if ldef is None:
                 result[key] = value
