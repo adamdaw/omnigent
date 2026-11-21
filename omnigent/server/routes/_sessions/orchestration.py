@@ -12561,14 +12561,11 @@ def _bundle_spec_starts_routing_on(metadata: SessionCreateMetadata, spec: AgentS
     :param metadata: Validated session metadata for the upload.
     :param spec: The uploaded bundle's validated spec.
     :returns: ``True`` when the new session's ``cost_control_mode_override`` must be ``"on"``.
+    :raises OmnigentError: ``invalid_input`` when the spec's value is invalid.
     """
     if metadata.parent_session_id is not None:
         return False
-    try:
-        return _validated_spec_smart_routing_default(spec)
-    except OmnigentError:
-        # An invalid value is left to the routing create that reports it.
-        return False
+    return _validated_spec_smart_routing_default(spec)
 
 
 def _spec_pins_its_brain(

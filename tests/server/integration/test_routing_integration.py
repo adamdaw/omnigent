@@ -1858,12 +1858,15 @@ async def test_an_uploaded_bundle_takes_the_spec_routing_default(
 
 
 async def test_an_invalid_spec_routing_default_is_rejected(client: httpx.AsyncClient) -> None:
-    agent = await create_test_agent(
-        client,
+    bundle = build_agent_bundle(
         name="routing-default-invalid",
         executor={"type": "omnigent", "config": {"smart_routing_default": "always"}},
     )
-    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
     assert resp.status_code == 400, resp.text
     assert "smart_routing_default" in resp.text
 
