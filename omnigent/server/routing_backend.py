@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
 
     from omnigent.server.smart_routing import RoutingClient, RoutingResult
 
@@ -143,6 +143,7 @@ async def route_with_fallback(
     available_models: dict[str, list[str]],
     *,
     gateway_backed: bool,
+    cost_ordered: Mapping[str, bool] | None = None,
 ) -> RoutedCall | None:
     """Call the deployment's router, falling back to the judge when it fails.
 
@@ -166,13 +167,20 @@ async def route_with_fallback(
     if choice is None:
         return None
 
+    from omnigent.server.smart_routing import LLMRoutingClient
+
+    async def route_local(client: RoutingClient) -> RoutingResult | None:
+        if isinstance(client, LLMRoutingClient):
+            return await client.route(message, available_models, cost_ordered=cost_ordered)
+        return await client.route(message, available_models)
+
     async def invoke() -> RoutingResult | None:
         route_for_gateway = getattr(choice.client, "route_for_gateway", None)
         if route_for_gateway is not None:
             return await route_for_gateway(
                 message, available_models, gateway_backed=gateway_backed
             )
-        return await choice.client.route(message, available_models)
+        return await route_local(choice.client)
 
     if choice.source == "oss-llm" or backends.local is None:
         return RoutedCall(
@@ -200,7 +208,7 @@ async def route_with_fallback(
 
         try:
             result = await asyncio.wait_for(
-                backends.local.route(message, available_models),
+                route_local(backends.local),
                 timeout=NON_GATEWAY_JUDGE_TIMEOUT_S,
             )
         except TimeoutError:
@@ -208,7 +216,7 @@ async def route_with_fallback(
                 result=None, source="oss-llm", client=backends.local, reason="judge timed out"
             )
     else:
-        result = await backends.local.route(message, available_models)
+        result = await route_local(backends.local)
     return RoutedCall(result=result, source="oss-llm", client=backends.local)
 
 

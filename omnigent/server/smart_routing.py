@@ -33,7 +33,7 @@ from omnigent.models.model_fallbacks import (
     SMART_ROUTING_TASK_V1_CLAUDE_ARMS,
     SMART_ROUTING_TASK_V1_CODEX_ARMS,
 )
-from omnigent.models.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
+from omnigent.models.model_metadata import ModelCostTier, ModelWireAPI
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -136,26 +136,7 @@ def infer_models(
     if curated is None:
         return None
     arms = current_generation_models(current_generation)
-    models = [*curated, *arms.get(family, ())]
-    return _CatalogModels(models, tiered_ids=models)
-
-
-class _CatalogModels(list[str]):
-    """Candidate IDs with their catalog's cost-ordering availability."""
-
-    def __init__(self, models: Iterable[str], *, tiered_ids: Iterable[str]) -> None:
-        super().__init__(models)
-        self.tiered_ids = frozenset(tiered_ids)
-
-    @property
-    def cost_ordered(self) -> bool:
-        return any(model in self.tiered_ids for model in self)
-
-
-def _preserve_model_ordering(source: Iterable[str], models: Iterable[str]) -> list[str]:
-    if isinstance(source, _CatalogModels):
-        return _CatalogModels(models, tiered_ids=source.tiered_ids)
-    return list(models)
+    return [*curated, *arms.get(family, ())]
 
 
 def models_in_family(harness: str | None, models: Iterable[str]) -> list[str]:
@@ -171,10 +152,8 @@ def models_in_family(harness: str | None, models: Iterable[str]) -> list[str]:
 
     family = harness_family(harness)
     if family is None:
-        return _preserve_model_ordering(models, models)
-    return _preserve_model_ordering(
-        models, (model for model in models if model_in_family(family, model))
-    )
+        return list(models)
+    return [model for model in models if model_in_family(family, model)]
 
 
 def catalog_models_for_harness(
@@ -198,27 +177,34 @@ def catalog_models_for_harness(
     :returns: Servable model ids, or ``None`` when the catalog has no row
         for this harness.
     """
+    worker = catalog_worker_for_harness(catalog, harness, allow_self=allow_self)
+    return list(catalog[worker]) if catalog and worker is not None else None
+
+
+def catalog_worker_for_harness(
+    catalog: Mapping[str, list[str]] | None,
+    harness: str,
+    *,
+    allow_self: bool = False,
+) -> str | None:
+    """Find the worker row selected for a harness."""
     if not catalog:
         return None
-    own = catalog.get(harness)
-    if own:
-        return _preserve_model_ordering(own, own)
+    if catalog.get(harness):
+        return harness
     family = _HARNESS_FAMILY.get(harness)
-    for worker, worker_models in catalog.items():
-        if not worker_models:
-            continue
+    for worker, models in catalog.items():
         worker_harness = _WORKER_NAME_TO_HARNESS.get(worker)
-        if worker_harness is None:
-            continue
-        if worker_harness == harness or (
-            family is not None and _HARNESS_FAMILY.get(worker_harness) == family
+        if (
+            models
+            and worker_harness is not None
+            and (
+                worker_harness == harness
+                or (family is not None and _HARNESS_FAMILY.get(worker_harness) == family)
+            )
         ):
-            return _preserve_model_ordering(worker_models, worker_models)
-    if allow_self:
-        own_models = catalog.get("self")
-        if own_models:
-            return _preserve_model_ordering(own_models, own_models)
-    return None
+            return worker
+    return "self" if allow_self and catalog.get("self") else None
 
 
 def failure_detail(exc: BaseException) -> str:
@@ -487,13 +473,21 @@ async def fetch_runner_models(
     catalog = await _fetch_runner_catalog(session_id, runner_client)
     if catalog is None:
         return None
-    return {
-        worker: _CatalogModels(
-            (model.id for model in models),
-            tiered_ids=(model.id for model in models if model.cost_tier),
-        )
-        for worker, models in catalog.items()
-    }
+    return {worker: [model.id for model in models] for worker, models in catalog.items()}
+
+
+async def fetch_runner_models_with_ordering(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+) -> tuple[dict[str, list[str]], dict[str, bool]] | None:
+    """Return runner candidates and whether each complete row has cost tiers."""
+    catalog = await _fetch_runner_catalog(session_id, runner_client)
+    if catalog is None:
+        return None
+    return (
+        {worker: [model.id for model in models] for worker, models in catalog.items()},
+        {worker: all(model.cost_tier for model in models) for worker, models in catalog.items()},
+    )
 
 
 def _flatten_models(available_models: dict[str, list[str]]) -> list[str]:
@@ -531,54 +525,56 @@ Harness descriptions:
 - pi: Multi-model headless harness; can run both Claude and GPT models;
   best for read-only exploration, review, and cross-vendor verification.
 
-Each harness list is ordered by provider-relative cost when the catalog reports
-it, with provider catalog order as the tie-breaker. When cost ordering is unknown,
-choose the offered model best suited to the task instead of relying on position.
-When cost ordering is known, classify the task using these relative positions:
+{routing_instructions}
 
-  SIMPLE   → {fast_intent}: first available model
-             Examples: greetings, quick lookups, one-line fixes, trivial Q&A.
-
-  MODERATE → {balanced_intent}: middle available model
-             Examples: single-file edits, debugging a known issue, brief explanations.
-
-  COMPLEX  → {powerful_intent}: last available model
-             Examples: multi-file refactors, architecture decisions, security analysis,
-             long reasoning chains, tasks requiring high accuracy or broad context.
-
-The rationale field must follow this exact pattern so the explanation is consistent
-with the model chosen:
-  "This is a [SIMPLE/MODERATE/COMPLEX] task ([brief reason]); \
-selected [cheapest/mid-range/most capable] model [model-id]."
+The rationale field must follow this pattern:
+  "This is a [SIMPLE/MODERATE/COMPLEX] task ([brief reason]); selected model [model-id]."
 
 Return **strict JSON only**:
 {{"harness": "<harness-id>", "model": "<model-id>", "rationale": "<sentence>"}}
 """
 
 
-def _build_rubric(available_models: dict[str, list[str]]) -> str:
-    """Format the judge prompt with the harness → models structure."""
-    sections: list[str] = []
+def _build_rubric(
+    available_models: dict[str, list[str]],
+    cost_ordered: Mapping[str, bool] | None = None,
+) -> str:
+    """Format the judge prompt with per-harness ordering information."""
+    cost_ordered = cost_ordered or {}
+    sections = []
     for harness, models in available_models.items():
         model_lines = "\n".join(f"    - {m}" for m in models)
-        ordering = (
-            "unknown"
-            if not isinstance(models, _CatalogModels) or not models.cost_ordered
-            else "available"
-        )
+        ordering = "ordered" if cost_ordered.get(harness, True) else "unknown"
         sections.append(f"  harness: {harness} (cost ordering: {ordering})\n{model_lines}")
+    if any(not cost_ordered.get(h, True) for h in available_models):
+        instructions = (
+            "For a harness whose cost ordering is unknown, choose the offered model best "
+            "suited to the task. For clearly SIMPLE tasks prefer a smaller or older-generation "
+            "model. Classify each task as SIMPLE, MODERATE, or COMPLEX."
+        )
+        if any(cost_ordered.get(h, True) for h in available_models):
+            instructions += (
+                " For a harness marked ordered, use first for SIMPLE, middle for MODERATE, "
+                "and last for COMPLEX."
+            )
+    else:
+        instructions = (
+            "Classify the task as SIMPLE, MODERATE, or COMPLEX. "
+            "Choose the first model for SIMPLE, a middle model for MODERATE, "
+            "and the last model for COMPLEX."
+        )
     return _JUDGE_SYSTEM_TEMPLATE.format(
         harness_menu="\n".join(sections),
-        fast_intent=ModelIntent.FAST.value,
-        balanced_intent=ModelIntent.BALANCED.value,
-        powerful_intent=ModelIntent.POWERFUL.value,
+        routing_instructions=instructions,
     )
 
 
 _STATED_TIER = re.compile(r"This is an? (SIMPLE|MODERATE|COMPLEX) task\b")
 
 
-def _reconcile_with_stated_tier(model: str, rationale: str, models: list[str]) -> str:
+def _reconcile_with_stated_tier(
+    model: str, rationale: str, models: list[str], *, cost_ordered: bool = True
+) -> str:
     """Apply the list position the judge's own classification names.
 
     When cost ordering is known, the class determines the list position.
@@ -590,12 +586,7 @@ def _reconcile_with_stated_tier(model: str, rationale: str, models: list[str]) -
     :returns: *model*, or the model at the position its stated class names.
     """
     match = _STATED_TIER.match(rationale.lstrip())
-    if (
-        match is None
-        or model not in models
-        or not isinstance(models, _CatalogModels)
-        or not models.cost_ordered
-    ):
+    if match is None or model not in models or not cost_ordered:
         return model
     tier = match.group(1)
     position = models.index(model)
@@ -651,11 +642,13 @@ class LLMRoutingClient:
         self,
         message: str,
         available_models: dict[str, list[str]],
+        *,
+        cost_ordered: Mapping[str, bool] | None = None,
     ) -> RoutingResult | None:
         import asyncio
 
         flat = _flatten_models(available_models)
-        rubric = _build_rubric(available_models)
+        rubric = _build_rubric(available_models, cost_ordered)
         _logger.info(
             "LLMRoutingClient: available_models=%s prompt_chars=%d",
             dict(available_models),
@@ -744,7 +737,10 @@ class LLMRoutingClient:
 
         if model_is_candidate and chosen_harness is not None:
             model = _reconcile_with_stated_tier(
-                model, str(rationale), available_models[chosen_harness]
+                model,
+                str(rationale),
+                available_models[chosen_harness],
+                cost_ordered=(cost_ordered or {}).get(chosen_harness, True),
             )
         return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
 
@@ -2311,13 +2307,7 @@ async def route_session_harness(
             harness = _WORKER_NAME_TO_HARNESS.get(worker_name)
             if harness is None or harness not in candidate_harnesses:
                 continue
-            in_family = models_in_family(
-                harness,
-                _CatalogModels(
-                    (entry.id for entry in worker_catalog),
-                    tiered_ids=(entry.id for entry in worker_catalog if entry.cost_tier),
-                ),
-            )
+            in_family = models_in_family(harness, [entry.id for entry in worker_catalog])
             if in_family:
                 # First worker wins for a given harness id (dedupe). The catalog
                 # rows are kept alongside the ids so the post-verdict wire check
@@ -2356,7 +2346,13 @@ async def route_session_harness(
 
     try:
         call = await route_with_fallback(
-            backends, user_message, harness_models, gateway_backed=gateway_backed
+            backends,
+            user_message,
+            harness_models,
+            gateway_backed=gateway_backed,
+            cost_ordered={
+                h: all(row.cost_tier for row in rows) for h, rows in harness_catalog.items()
+            },
         )
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
@@ -2521,20 +2517,23 @@ async def route_turn(
     # workers' models are not this session's. Key the map by harness id, not the
     # "self" label, so the seam infers the right single-harness scenario.
     available: dict[str, list[str]] | None = None
+    cost_ordered: dict[str, bool] = {}
     if catalog:
         in_vocabulary = models_in_family(harness, catalog)
         if in_vocabulary:
             available = {harness or "self": in_vocabulary}
     if available is None and session_id and runner_client is not None:
         _catalog_fetched = True
-        runner_catalog = await fetch_runner_models(session_id, runner_client)
-        if runner_catalog and "self" in runner_catalog:
+        runner_result = await fetch_runner_models_with_ordering(session_id, runner_client)
+        runner_catalog, runner_ordering = runner_result or ({}, {})
+        if "self" in runner_catalog:
             # A native terminal's own catalog can list models from other
             # families (its gateway serves them all); offering those would
             # route the session onto a model its harness cannot run.
             in_family = models_in_family(harness, runner_catalog["self"])
             if in_family:
                 available = {harness or "self": in_family}
+                cost_ordered[harness or "self"] = runner_ordering["self"]
     if not available:
         # The static table contains Unity Catalog model-service ids, so off the
         # gateway it names models this pane cannot be switched to. Decline the
@@ -2559,10 +2558,9 @@ async def route_turn(
             name: runnable
             for name, models in available.items()
             if (
-                runnable := _preserve_model_ordering(
-                    models,
-                    (m for m in models if not harness_bars_model(harness, m, prefixes=prefixes)),
-                )
+                runnable := [
+                    m for m in models if not harness_bars_model(harness, m, prefixes=prefixes)
+                ]
             )
         }
         if not available:
@@ -2577,7 +2575,11 @@ async def route_turn(
     _prep_s = time.monotonic() - _prep_started
     _route_started = time.monotonic()
     call = await route_with_fallback(
-        backends, user_message, available, gateway_backed=gateway_backed
+        backends,
+        user_message,
+        available,
+        gateway_backed=gateway_backed,
+        cost_ordered=cost_ordered,
     )
     _logger.info(
         "smart_routing: session=%s prep=%.3fs router=%.3fs catalog_fetch=%s candidates=%d",
