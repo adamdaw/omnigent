@@ -9027,11 +9027,15 @@ class _SessionEventDispatchResult:
         ``"pending_a1b2c3"`` — surfaced to the sender so it can adopt
         the id and dedupe against the snapshot. ``None`` for non-native
         events (already persisted, so no separate pending entry).
+    :param model_routing: The routing decision this request made, e.g.
+        ``{"picked_model": "m", "applied": True, "model": "m"}``; ``None`` when
+        it made none.
     """
 
     item_id: str | None
     pending_id: str | None
     accepted: bool = True
+    model_routing: dict[str, Any] | None = None
 
 
 def _extract_persistent_item_from_sse(

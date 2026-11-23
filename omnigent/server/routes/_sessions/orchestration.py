@@ -108,9 +108,12 @@ from omnigent.runner.mcp_execution_registry import (
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
+    EXPLICIT_MODEL_LABEL_KEY,
     PINNED_BRAIN_LABEL_KEY,
     PINNED_BRAIN_WORKER_LABEL_KEY,
+    ROUTING_APPLIED_LABEL_KEY,
     ROUTING_DECISION_LABEL_KEY,
+    ROUTING_PICKED_MODEL_LABEL_KEY,
     auto_harness_session,
     declared_worker_of_pinned_brain,
     harness_family,
@@ -8195,6 +8198,7 @@ async def _forward_event_to_runner(
     host_store: HostStore | None = None,
     agent_revision: str | None = None,
     startup_input_id: str | None = None,
+    routing_out: dict[str, Any] | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -8228,6 +8232,8 @@ async def _forward_event_to_runner(
         ``None`` reads as unknown, which counts as backed.
     :param agent_revision: The agent's effective bundle and selection revision; the
         runner rebuilds the session's spec when it changes.
+    :param routing_out: Filled with this request's routing decision
+        (see :func:`_routing_report`) when it made one; left empty otherwise.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
@@ -8532,12 +8538,15 @@ async def _forward_event_to_runner(
     _child_routed_before = conv.parent_conversation_id is not None and bool(
         conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     )
-    # For child sessions, route even when the orchestrator specified a model via
-    # sys_session_send (effective_runner_override is already set). Smart routing
-    # always wins over the LLM's own model choice when the parent toggle is on.
+    # A child whose dispatch named a model keeps it. An inherited parent model
+    # carries no label, so it is still set aside by routing.
+    _explicit_child_model = (
+        bool(conv.labels.get(EXPLICIT_MODEL_LABEL_KEY)) and conv.model_override is not None
+    )
     _should_route = (
         _routing_enabled
         and body.type == "message"
+        and not _explicit_child_model
         # The auto-harness block above already routed this turn (harness +
         # model) — don't re-run the router for the same message.
         and not _auto_resolved_this_turn
@@ -8804,8 +8813,20 @@ async def _forward_event_to_runner(
                 # create-time outage the reason nothing routes this session
                 # again. The card still shows what happened.
                 await _stamp_routing_decision_label(
-                    session_id, conversation_store, _auto_decision_id
+                    session_id,
+                    conversation_store,
+                    _auto_decision_id,
+                    picked_model=_auto_card_model,
+                    applied=_auto_card_model == conv.model_override,
                 )
+                if routing_out is not None:
+                    routing_out.update(
+                        _routing_report(
+                            _auto_card_model,
+                            _auto_card_model == conv.model_override,
+                            conv.model_override,
+                        )
+                    )
             if conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
                     conv.parent_conversation_id,
@@ -8821,7 +8842,7 @@ async def _forward_event_to_runner(
             _decision_scope = "child_session" if _parent_routing_on else "turn"
             if _turn_unapplied:
                 _verdict = _unapplied_routed_verdict(_routed_model, _verdict)
-            # The router wins over the orchestrator's own pick; the attempt is
+            # The router wins over an inherited model; the attempt is
             # recorded so the UI can show what it overrode. Compared on the bare
             # arm, so another spelling of the same model (a spawn's
             # ``system.ai.glm-5-2`` against the router's ``databricks-glm-5-2``)
@@ -8849,7 +8870,17 @@ async def _forward_event_to_runner(
                 # label is the route-once gate, so stamping it would make one
                 # outage the reason the session never routes again. The card
                 # still shows what happened.
-                await _stamp_routing_decision_label(session_id, conversation_store, _decision_id)
+                await _stamp_routing_decision_label(
+                    session_id,
+                    conversation_store,
+                    _decision_id,
+                    picked_model=_routed_model,
+                    applied=not _turn_unapplied,
+                )
+                if routing_out is not None:
+                    routing_out.update(
+                        _routing_report(_routed_model, not _turn_unapplied, _attempted_override)
+                    )
             # Mirror the routing decision into the parent session so the
             # orchestrator's transcript also shows which model was chosen
             # for this sub-agent — the decision is otherwise only visible
@@ -8887,10 +8918,30 @@ async def _forward_event_to_runner(
     return persisted_items[0].id
 
 
+def _routing_report(picked_model: str, applied: bool, prior_model: str | None) -> dict[str, Any]:
+    """
+    Describe one routing decision for the message response.
+
+    :param picked_model: The model the router chose.
+    :param applied: Whether the session was switched onto it.
+    :param prior_model: The model the session ran on before the decision.
+    :returns: ``{"picked_model", "applied", "model"}``; ``model`` is what the
+        session runs on after the decision.
+    """
+    return {
+        "picked_model": picked_model,
+        "applied": applied,
+        "model": picked_model if applied else prior_model,
+    }
+
+
 async def _stamp_routing_decision_label(
     session_id: str,
     conversation_store: ConversationStore,
     decision_id: str | None,
+    *,
+    picked_model: str | None = None,
+    applied: bool = True,
 ) -> None:
     """Record the decision behind a session's pinned model as a label.
 
@@ -8900,15 +8951,18 @@ async def _stamp_routing_decision_label(
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store exposing ``set_labels``.
     :param decision_id: Decision identity, or ``None`` to skip.
+    :param picked_model: The model the router picked; recorded with *applied*
+        so a dispatcher can tell a pick the session took from one it could not.
+    :param applied: Whether the session was switched onto *picked_model*.
     """
     if decision_id is None:
         return
+    labels = {ROUTING_DECISION_LABEL_KEY: decision_id}
+    if picked_model is not None:
+        labels[ROUTING_PICKED_MODEL_LABEL_KEY] = picked_model
+        labels[ROUTING_APPLIED_LABEL_KEY] = "1" if applied else "0"
     try:
-        await asyncio.to_thread(
-            conversation_store.set_labels,
-            session_id,
-            {ROUTING_DECISION_LABEL_KEY: decision_id},
-        )
+        await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
     except (OSError, ValueError):
         _logger.warning(
             "smart_routing: failed to label routing decision for session=%s",
@@ -9423,8 +9477,11 @@ async def _dispatch_session_event_to_runner_impl(
         # pane cannot take must not become ``model_override``, which would
         # disable routing for every later turn and misattribute usage.
         _native_applied_model: str | None = None
-        if _native_routing_enabled and (
-            conv.model_override is None or conv.parent_conversation_id is not None
+        _native_report: dict[str, Any] | None = None
+        if (
+            _native_routing_enabled
+            and not (conv.labels.get(EXPLICIT_MODEL_LABEL_KEY) and conv.model_override is not None)
+            and (conv.model_override is None or conv.parent_conversation_id is not None)
         ):
             from omnigent.server.smart_routing import route_turn_or_decline
 
@@ -9573,7 +9630,16 @@ async def _dispatch_session_event_to_runner_impl(
                 # claim it — one outage would otherwise stop this pane's
                 # in-harness hook from ever routing.
                 await _stamp_routing_decision_label(
-                    session_id, conversation_store, _native_decision_id
+                    session_id,
+                    conversation_store,
+                    _native_decision_id,
+                    picked_model=_native_routed_model,
+                    applied=_native_applied_model is not None,
+                )
+                _native_report = _routing_report(
+                    _native_routed_model,
+                    _native_applied_model is not None,
+                    conv.model_override,
                 )
             if _native_parent_routing_on and conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
@@ -9586,9 +9652,12 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
                 )
-        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+        return _SessionEventDispatchResult(
+            item_id=None, pending_id=pending_id, model_routing=_native_report
+        )
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
         return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
+    routing_report: dict[str, Any] = {}
     item_id = await _forward_event_to_runner(
         session_id,
         conv,
@@ -9603,8 +9672,11 @@ async def _dispatch_session_event_to_runner_impl(
         host_store=host_store,
         agent_revision=agent_revision,
         startup_input_id=startup_input.input_id if startup_input is not None else None,
+        routing_out=routing_report,
     )
-    return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+    return _SessionEventDispatchResult(
+        item_id=item_id, pending_id=None, model_routing=routing_report or None
+    )
 
 
 # Sized to the runner liveness lease so the relay give-up, the disconnect
@@ -13214,6 +13286,10 @@ async def _create_session_from_existing_agent(
     # applied codex verdict while running pi, and a ``claude-native`` worker
     # lost its terminal labels (skipped for forced-auto children below). Those
     # children route in their own family instead.
+    # The label only counts alongside a model: without one there is nothing to keep.
+    _explicit_model = model_override is not None and bool(
+        (body.labels or {}).get(EXPLICIT_MODEL_LABEL_KEY)
+    )
     _force_auto_for_child = False
     _parent_for_routing: Conversation | None = None
     _pinned_brain_worker = False
@@ -13225,6 +13301,7 @@ async def _create_session_from_existing_agent(
             _parent_for_routing is not None
             and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
             and auto_harness_session(_parent_for_routing)
+            and not _explicit_model
             and not await asyncio.to_thread(_spawn_pins_its_harness, body, agent, agent_cache)
         ):
             try:
@@ -13288,15 +13365,21 @@ async def _create_session_from_existing_agent(
         # "auto" behind would make the first message re-route an already-running
         # terminal. The auto marker is stamped as a label below instead.
         harness_override = None
-    elif _force_auto_for_child or _spec_auto_brain or body.harness_override == "auto":
+    elif not _explicit_model and (
+        _force_auto_for_child or _spec_auto_brain or body.harness_override == "auto"
+    ):
         await asyncio.to_thread(_validated_harness_override_executor_type, agent)
         harness_override = "auto"
-        # Ignore any orchestrator-supplied model; routing picks it. (The spec
-        # opt-in never reaches here with a client model, so none is dropped.)
+        # Ignore any orchestrator-supplied model; routing picks it.
         model_override = None
     else:
+        # An explicit model is never re-decided, so "auto" (which re-routes the
+        # harness and model on the first message) is dropped: the child runs the
+        # spec's own harness, or the one the dispatch pinned, on the named model.
         harness_override = await asyncio.to_thread(
-            _validated_harness_override, body.harness_override, agent
+            _validated_harness_override,
+            None if _explicit_model and body.harness_override == "auto" else body.harness_override,
+            agent,
         )
 
     inference_snapshot = None

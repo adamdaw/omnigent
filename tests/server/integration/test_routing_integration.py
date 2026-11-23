@@ -19,9 +19,12 @@ import pytest
 from omnigent.runner import subagent_routing
 from omnigent.runner.subagent_routing import (
     AUTO_HARNESS_LABEL_KEY,
+    EXPLICIT_MODEL_LABEL_KEY,
     PINNED_BRAIN_LABEL_KEY,
     PINNED_BRAIN_WORKER_LABEL_KEY,
+    ROUTING_APPLIED_LABEL_KEY,
     ROUTING_DECISION_LABEL_KEY,
+    ROUTING_PICKED_MODEL_LABEL_KEY,
 )
 from omnigent.server.routes._sessions import orchestration as orchestration_module
 from omnigent.server.routes._sessions.common import get_server_host_registry
@@ -98,10 +101,10 @@ def _routing_decisions(conv_store: SqlAlchemyConversationStore, session_id: str)
     ]
 
 
-# ── 1. Child spawn: the router wins over ``args.model`` ─────────────
+# ── 1. Child spawn: the router replaces an inherited model, not a named one ──
 
 
-async def test_router_overrides_llm_supplied_child_model(
+async def test_router_overrides_unnamed_inherited_child_model(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
@@ -132,7 +135,8 @@ async def test_router_overrides_llm_supplied_child_model(
 
     refreshed = conv_store.get_conversation(child.id)
     assert refreshed is not None
-    # The router's pick replaced the orchestrator's ``args.model``.
+    # No ``args.model`` was named (the label is absent), so the router's pick
+    # replaces the model the child inherited.
     assert refreshed.model_override == ROUTED_MODEL
     decisions = _routing_decisions(conv_store, child.id)
     assert len(decisions) == 1
@@ -143,6 +147,95 @@ async def test_router_overrides_llm_supplied_child_model(
     assert data.decision_id
     # The decision is joined onto the child row for the sidebar.
     assert refreshed.labels.get(ROUTING_DECISION_LABEL_KEY) == data.decision_id
+    # The pick was applied, and the labels say so for the dispatcher's report.
+    assert refreshed.labels.get(ROUTING_APPLIED_LABEL_KEY) == "1"
+    assert refreshed.labels.get(ROUTING_PICKED_MODEL_LABEL_KEY) == ROUTED_MODEL
+
+
+async def _forward_first_child_message(
+    child: Any,
+    conv_store: SqlAlchemyConversationStore,
+    routing_out: dict[str, Any] | None = None,
+) -> Any:
+    caps = FakeCaps(
+        routing_client=FakeRoutingClient(
+            RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
+        )
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child.id, child, body, conv_store, runner_client, routing_out=routing_out
+            )
+    refreshed = conv_store.get_conversation(child.id)
+    assert refreshed is not None
+    return refreshed
+
+
+async def test_explicit_child_model_beats_smart_routing(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _parent, child, conv_store = await _parent_and_child(
+        client,
+        db_uri,
+        agent_name="explicit-model-wins",
+        child_model_override=LLM_PICKED_MODEL,
+    )
+    conv_store.set_labels(child.id, {EXPLICIT_MODEL_LABEL_KEY: "1"})
+    child = conv_store.get_conversation(child.id)
+    assert child is not None
+
+    routing_out: dict[str, Any] = {}
+    refreshed = await _forward_first_child_message(child, conv_store, routing_out)
+
+    # The model the caller named stays; the router is not consulted.
+    assert refreshed.model_override == LLM_PICKED_MODEL
+    assert _routing_decisions(conv_store, child.id) == []
+    assert ROUTING_DECISION_LABEL_KEY not in refreshed.labels
+    assert routing_out == {}
+
+
+async def test_the_message_that_routes_reports_its_own_decision(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _parent, child, conv_store = await _parent_and_child(
+        client,
+        db_uri,
+        agent_name="routing-report-applied",
+        child_model_override=LLM_PICKED_MODEL,
+    )
+
+    routing_out: dict[str, Any] = {}
+    await _forward_first_child_message(child, conv_store, routing_out)
+
+    assert routing_out == {"picked_model": ROUTED_MODEL, "applied": True, "model": ROUTED_MODEL}
+
+
+async def test_a_continuation_that_is_already_routed_reports_nothing(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _parent, child, conv_store = await _parent_and_child(
+        client,
+        db_uri,
+        agent_name="routing-report-continuation",
+        child_model_override=LLM_PICKED_MODEL,
+    )
+    await _forward_first_child_message(child, conv_store)
+    routed = conv_store.get_conversation(child.id)
+    assert routed is not None
+
+    routing_out: dict[str, Any] = {}
+    await _forward_first_child_message(routed, conv_store, routing_out)
+
+    # The decision already on the row is not this request's, so it is not reported.
+    assert routing_out == {}
 
 
 async def test_another_spelling_of_the_routed_model_is_no_override(
@@ -2038,6 +2131,7 @@ async def _dispatch_native_turn(
     *,
     model: str,
     routing_client: Any = None,  # type: ignore[explicit-any]
+    results: list[Any] | None = None,  # type: ignore[explicit-any]
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Send one web message into a native pane with the router returning *model*.
 
@@ -2046,6 +2140,7 @@ async def _dispatch_native_turn(
     :param model: Model the fake router picks for this turn.
     :param routing_client: Routing-client double to use, so a caller can read
         back what was offered. ``None`` builds one returning *model*.
+    :param results: Collects the dispatch result when given.
     :returns: The last routing-decision item's data and the forwarded bodies.
     """
     forwarded: list[dict[str, Any]] = []
@@ -2076,7 +2171,7 @@ async def _dispatch_native_turn(
                 new=AsyncMock(return_value=runner_client),
             ),
         ):
-            await orchestration_module._dispatch_session_event_to_runner_impl(
+            result = await orchestration_module._dispatch_session_event_to_runner_impl(
                 conv.id,
                 conv,
                 body,
@@ -2086,7 +2181,10 @@ async def _dispatch_native_turn(
                 file_store=None,
                 artifact_store=None,
             )
-    return _routing_decisions(conv_store, conv.id)[-1].data, forwarded
+            if results is not None:
+                results.append(result)
+    decisions = _routing_decisions(conv_store, conv.id)
+    return (decisions[-1].data if decisions else None), forwarded
 
 
 async def test_a_childs_second_spawn_cannot_pin_a_model_the_pane_rejects(
@@ -2945,3 +3043,133 @@ async def test_an_auto_harness_outage_leaves_the_route_once_label_unclaimed(
     assert routed is not None
     assert routed.model_override == GPT_MODEL
     assert routed.labels.get(ROUTING_DECISION_LABEL_KEY)
+
+
+async def test_explicit_label_without_a_model_does_not_suppress_routing(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _parent, child, conv_store = await _parent_and_child(
+        client, db_uri, agent_name="explicit-label-no-model"
+    )
+    conv_store.set_labels(child.id, {EXPLICIT_MODEL_LABEL_KEY: "1"})
+    child = conv_store.get_conversation(child.id)
+    assert child is not None
+
+    refreshed = await _forward_first_child_message(child, conv_store)
+
+    # A label with nothing to protect cannot be used to opt out of routing.
+    assert refreshed.model_override == ROUTED_MODEL
+    assert len(_routing_decisions(conv_store, child.id)) == 1
+
+
+async def test_native_child_with_an_explicit_model_is_not_routed(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    child, conv_store = await _native_child(client, db_uri, agent_name="routing-native-explicit")
+    conv_store.update_conversation(child.id, model_override=LLM_PICKED_MODEL)
+    conv_store.set_labels(child.id, {EXPLICIT_MODEL_LABEL_KEY: "1"})
+    child = conv_store.get_conversation(child.id)
+    assert child is not None
+
+    data, forwarded = await _dispatch_native_turn(child, conv_store, model=ROUTED_MODEL)
+
+    assert data is None
+    assert [f.get("model_override") for f in forwarded] == [None]
+    refreshed = conv_store.get_conversation(child.id)
+    assert refreshed is not None
+    assert refreshed.model_override == LLM_PICKED_MODEL
+    assert ROUTING_DECISION_LABEL_KEY not in refreshed.labels
+
+
+async def test_native_decision_labels_record_whether_the_pick_was_applied(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    child, conv_store = await _native_child(client, db_uri, agent_name="routing-native-applied")
+    orchestration_module._model_options_cache[child.id] = [
+        {"id": "opus", "model": ROUTED_MODEL},
+    ]
+    results: list[Any] = []
+    try:
+        await _dispatch_native_turn(child, conv_store, model=ROUTED_MODEL, results=results)
+        first = conv_store.get_conversation(child.id)
+        assert first is not None
+        # A second pick the pane cannot take is recorded, but not as applied.
+        await _dispatch_native_turn(first, conv_store, model=GPT_MODEL, results=results)
+    finally:
+        orchestration_module._model_options_cache.pop(child.id, None)
+
+    # Each message's own response carries its decision.
+    assert [r.model_routing for r in results] == [
+        {"picked_model": ROUTED_MODEL, "applied": True, "model": ROUTED_MODEL},
+        {"picked_model": GPT_MODEL, "applied": False, "model": ROUTED_MODEL},
+    ]
+
+    assert first.labels.get(ROUTING_APPLIED_LABEL_KEY) == "1"
+    second = conv_store.get_conversation(child.id)
+    assert second is not None
+    assert second.labels.get(ROUTING_APPLIED_LABEL_KEY) == "0"
+    assert second.labels.get(ROUTING_PICKED_MODEL_LABEL_KEY) == GPT_MODEL
+    assert second.model_override == ROUTED_MODEL
+
+
+@pytest.mark.parametrize(
+    ("case", "executor_config", "create_body"),
+    [
+        (
+            "spec-opt-in",
+            {"harness": "claude-sdk", "smart_routing_harness": "auto"},
+            {"cost_control_mode_override": "on"},
+        ),
+        (
+            "client-sentinel",
+            {"harness": "claude-sdk"},
+            {"cost_control_mode_override": "on", "harness_override": "auto"},
+        ),
+    ],
+)
+@pytest.mark.parametrize("child_harness_override", [None, "auto"])
+async def test_create_keeps_an_explicit_model_on_auto_harness_paths(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    case: str,
+    executor_config: dict[str, Any],
+    create_body: dict[str, Any],
+    child_harness_override: str | None,
+) -> None:
+    agent = await create_test_agent(
+        client,
+        name=f"explicit-create-{case}-{child_harness_override}",
+        executor={"type": "omnigent", "config": executor_config},
+    )
+    parent = await client.post("/v1/sessions", json={"agent_id": agent["id"], **create_body})
+    assert parent.status_code == 201, parent.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child_body: dict[str, Any] = {
+        "agent_id": agent["id"],
+        "parent_session_id": parent.json()["id"],
+        "model_override": LLM_PICKED_MODEL,
+    }
+    if child_harness_override is not None:
+        child_body["harness_override"] = child_harness_override
+
+    unlabelled = await client.post("/v1/sessions", json=child_body)
+    labelled = await client.post(
+        "/v1/sessions", json={**child_body, "labels": {EXPLICIT_MODEL_LABEL_KEY: "1"}}
+    )
+
+    assert unlabelled.status_code == 201, unlabelled.text
+    assert labelled.status_code == 201, labelled.text
+    free = conv_store.get_conversation(str(unlabelled.json()["id"]))
+    named = conv_store.get_conversation(str(labelled.json()["id"]))
+    assert free is not None
+    assert named is not None
+    # Control: without the label the model is still handed to the router.
+    assert free.harness_override == "auto"
+    assert free.model_override is None
+    # With it, the model survives and the child is not re-decided onto another harness.
+    assert named.model_override == LLM_PICKED_MODEL
+    assert named.harness_override != "auto"
+    assert AUTO_HARNESS_LABEL_KEY not in named.labels

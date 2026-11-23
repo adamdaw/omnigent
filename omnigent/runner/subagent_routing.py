@@ -99,6 +99,16 @@ HOOK_REQUEST_TIMEOUT_S = 15.0
 #: a new column or a transcript scan.
 ROUTING_DECISION_LABEL_KEY = "omnigent.routing.decision_id"
 
+#: Labels recording what a routing decision picked and whether the session took
+#: it ("1"/"0"). Stamped with the decision label; absent on older decisions.
+ROUTING_PICKED_MODEL_LABEL_KEY = "omnigent.routing.picked_model"
+ROUTING_APPLIED_LABEL_KEY = "omnigent.routing.applied"
+
+#: Conversation label set when the dispatching caller named the child's model
+#: (``sys_session_send`` ``args.model``). Smart Routing leaves such a model
+#: alone; an inherited parent model carries no label and is still routable.
+EXPLICIT_MODEL_LABEL_KEY = "omnigent.dispatch.explicit_model"
+
 #: Conversation label fingerprinting the prompt a create-time route scored.
 #: A native Smart Routing create routes the prompt the user typed on the
 #: landing screen, and that same prompt is then submitted inside the harness —
