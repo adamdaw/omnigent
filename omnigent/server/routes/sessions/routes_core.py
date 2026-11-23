@@ -169,6 +169,7 @@ from omnigent.server.routes._sessions.helpers import (
     _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history,
     _agent_forks_opencode_native_session,
+    _agent_pins_its_brain,
     _announce_session_added,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
@@ -5273,6 +5274,13 @@ def register_core_routes(
                 fresh_launch_args = fresh_launch_args[1:]
             if fresh_launch_args != source.terminal_launch_args:
                 override_launch_args, launch_args_set = fresh_launch_args, True
+
+        # The store never copies the Smart Routing pins; the fork's own target
+        # spec decides whether it is a pinned brain.
+        if await asyncio.to_thread(_agent_pins_its_brain, base_agent, agent_cache):
+            from omnigent.runner.subagent_routing import PINNED_BRAIN_LABEL_KEY
+
+            extra_labels[PINNED_BRAIN_LABEL_KEY] = "1"
 
         # Side chats use the source for shared-runner routing and stay hidden
         # from the sidebar while appearing in the Workspace rail.

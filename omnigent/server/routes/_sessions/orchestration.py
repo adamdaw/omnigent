@@ -108,9 +108,16 @@ from omnigent.runner.mcp_execution_registry import (
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
+    EXPLICIT_MODEL_LABEL_KEY,
+    PINNED_BRAIN_LABEL_KEY,
+    PINNED_BRAIN_WORKER_LABEL_KEY,
+    ROUTING_APPLIED_LABEL_KEY,
     ROUTING_DECISION_LABEL_KEY,
+    ROUTING_PICKED_MODEL_LABEL_KEY,
     auto_harness_session,
+    declared_worker_of_pinned_brain,
     harness_family,
+    pinned_brain_session,
     subagent_routing_enabled,
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -270,6 +277,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # Lower-layer helpers (SSE builders, publishers, persistence, runner-forward
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
+    AUTO_HARNESS_SENTINEL,
+    PINNED_BRAIN_VALUE,
     SessionLiveness,
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
@@ -372,6 +381,7 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_subagent_spec,
     _resource_event_item_from_sse,
     _routing_decision_item_from_sse,
+    _routing_spec,
     _runner_supports_side_chat_settings,
     _RunnerForwardResult,
     _seed_missing_title_from_user_message,
@@ -379,6 +389,7 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_with_child_rollup,
     _SessionEventDispatchResult,
     _signal_terminal_resolved_harness_elicitation,
+    _spec_brain_routing,
     _spec_harness,
     _stable_id_reuse_is_exact_retry,
     _stop_session_via_runner,
@@ -388,6 +399,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_cost_control_mode_override,
     _validated_harness_override,
     _validated_harness_override_executor_type,
+    _validated_spec_smart_routing_default,
     _validated_spec_smart_routing_harness,
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
@@ -8037,6 +8049,7 @@ def _pinned_spawn_family(parent: Conversation | None) -> str | None:
 def _reject_out_of_family_child(
     parent: Conversation | None,
     child_harness: str | None,
+    declared_worker_harnesses: frozenset[str] = frozenset(),
 ) -> None:
     """Refuse a pinned parent's create of a child in another family.
 
@@ -8050,12 +8063,17 @@ def _reject_out_of_family_child(
     :param child_harness: The harness the child would run, e.g.
         ``"claude-native"``. ``None`` (unresolvable) is allowed through —
         nothing proves it is out of family.
+    :param declared_worker_harnesses: Harnesses the parent's bundle declares
+        for this child's worker (see :func:`_declared_worker_harnesses`). A
+        pinned-brain parent may spawn a declared worker on any of them.
     :raises OmnigentError: 400 ``INVALID_INPUT`` when the child's family
         differs from the family the parent's spawns are confined to.
     """
     family = _pinned_spawn_family(parent)
     child_family = harness_family(child_harness)
     if family is None or child_family is None or family == child_family:
+        return
+    if child_harness in declared_worker_harnesses:
         return
     parent_harness = _resolve_harness(parent)
     raise OmnigentError(
@@ -8091,6 +8109,8 @@ def _out_of_family_spawn_notice(
         spawn may be routed.
     """
     if parent is None or auto_harness_session(conv, parent):
+        return None
+    if declared_worker_of_pinned_brain(conv, parent):
         return None
     parent_harness = _resolve_harness(parent)
     parent_family = harness_family(parent_harness)
@@ -8178,6 +8198,7 @@ async def _forward_event_to_runner(
     host_store: HostStore | None = None,
     agent_revision: str | None = None,
     startup_input_id: str | None = None,
+    routing_out: dict[str, Any] | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -8211,6 +8232,8 @@ async def _forward_event_to_runner(
         ``None`` reads as unknown, which counts as backed.
     :param agent_revision: The agent's effective bundle and selection revision; the
         runner rebuilds the session's spec when it changes.
+    :param routing_out: Filled with this request's routing decision
+        (see :func:`_routing_report`) when it made one; left empty otherwise.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
@@ -8384,7 +8407,26 @@ async def _forward_event_to_runner(
     _auto_route_failed = False
     # The resolved harness, read back at card-emission time below.
     _auto_harness: str | None = None
-    if conv.harness_override == "auto" and body.type == "message":
+    if conv.harness_override == "auto" and pinned_brain_session(conv):
+        # A pinned brain is never handed to the router. A stray sentinel (a
+        # legacy or copied row) is cleared so the brain runs its own harness.
+        _logger.warning(
+            "auto-harness: cleared the sentinel on pinned brain session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        _unpinned = await asyncio.to_thread(
+            conversation_store.update_conversation,
+            session_id,
+            _unset_harness_override=True,
+        )
+        if _unpinned is not None:
+            conv = _unpinned
+    if (
+        conv.harness_override == "auto"
+        and body.type == "message"
+        and not pinned_brain_session(conv)
+    ):
         from omnigent.server.smart_routing import (
             _AUTO_ROUTING_HARNESSES,
             route_session_harness,
@@ -8462,8 +8504,12 @@ async def _forward_event_to_runner(
         _parent_routing_on = _parent_conv is not None and subagent_routing_enabled(
             _parent_conv.subagent_routing_override
         )
+    # A pinned brain (``smart_routing_harness: pinned``) keeps its own model;
+    # only its spawns are routed.
     _routing_enabled = (
-        conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
+        conv.cost_control_mode_override == "on"
+        and conv.parent_conversation_id is None
+        and not pinned_brain_session(conv)
     ) or _parent_routing_on
     _routed_model: str | None = None
     _routed_harness: str | None = None
@@ -8492,12 +8538,15 @@ async def _forward_event_to_runner(
     _child_routed_before = conv.parent_conversation_id is not None and bool(
         conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     )
-    # For child sessions, route even when the orchestrator specified a model via
-    # sys_session_send (effective_runner_override is already set). Smart routing
-    # always wins over the LLM's own model choice when the parent toggle is on.
+    # A child whose dispatch named a model keeps it. An inherited parent model
+    # carries no label, so it is still set aside by routing.
+    _explicit_child_model = (
+        bool(conv.labels.get(EXPLICIT_MODEL_LABEL_KEY)) and conv.model_override is not None
+    )
     _should_route = (
         _routing_enabled
         and body.type == "message"
+        and not _explicit_child_model
         # The auto-harness block above already routed this turn (harness +
         # model) — don't re-run the router for the same message.
         and not _auto_resolved_this_turn
@@ -8764,8 +8813,20 @@ async def _forward_event_to_runner(
                 # create-time outage the reason nothing routes this session
                 # again. The card still shows what happened.
                 await _stamp_routing_decision_label(
-                    session_id, conversation_store, _auto_decision_id
+                    session_id,
+                    conversation_store,
+                    _auto_decision_id,
+                    picked_model=_auto_card_model,
+                    applied=_auto_card_model == conv.model_override,
                 )
+                if routing_out is not None:
+                    routing_out.update(
+                        _routing_report(
+                            _auto_card_model,
+                            _auto_card_model == conv.model_override,
+                            conv.model_override,
+                        )
+                    )
             if conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
                     conv.parent_conversation_id,
@@ -8781,7 +8842,7 @@ async def _forward_event_to_runner(
             _decision_scope = "child_session" if _parent_routing_on else "turn"
             if _turn_unapplied:
                 _verdict = _unapplied_routed_verdict(_routed_model, _verdict)
-            # The router wins over the orchestrator's own pick; the attempt is
+            # The router wins over an inherited model; the attempt is
             # recorded so the UI can show what it overrode. Compared on the bare
             # arm, so another spelling of the same model (a spawn's
             # ``system.ai.glm-5-2`` against the router's ``databricks-glm-5-2``)
@@ -8809,7 +8870,17 @@ async def _forward_event_to_runner(
                 # label is the route-once gate, so stamping it would make one
                 # outage the reason the session never routes again. The card
                 # still shows what happened.
-                await _stamp_routing_decision_label(session_id, conversation_store, _decision_id)
+                await _stamp_routing_decision_label(
+                    session_id,
+                    conversation_store,
+                    _decision_id,
+                    picked_model=_routed_model,
+                    applied=not _turn_unapplied,
+                )
+                if routing_out is not None:
+                    routing_out.update(
+                        _routing_report(_routed_model, not _turn_unapplied, _attempted_override)
+                    )
             # Mirror the routing decision into the parent session so the
             # orchestrator's transcript also shows which model was chosen
             # for this sub-agent — the decision is otherwise only visible
@@ -8847,10 +8918,30 @@ async def _forward_event_to_runner(
     return persisted_items[0].id
 
 
+def _routing_report(picked_model: str, applied: bool, prior_model: str | None) -> dict[str, Any]:
+    """
+    Describe one routing decision for the message response.
+
+    :param picked_model: The model the router chose.
+    :param applied: Whether the session was switched onto it.
+    :param prior_model: The model the session ran on before the decision.
+    :returns: ``{"picked_model", "applied", "model"}``; ``model`` is what the
+        session runs on after the decision.
+    """
+    return {
+        "picked_model": picked_model,
+        "applied": applied,
+        "model": picked_model if applied else prior_model,
+    }
+
+
 async def _stamp_routing_decision_label(
     session_id: str,
     conversation_store: ConversationStore,
     decision_id: str | None,
+    *,
+    picked_model: str | None = None,
+    applied: bool = True,
 ) -> None:
     """Record the decision behind a session's pinned model as a label.
 
@@ -8860,15 +8951,18 @@ async def _stamp_routing_decision_label(
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store exposing ``set_labels``.
     :param decision_id: Decision identity, or ``None`` to skip.
+    :param picked_model: The model the router picked; recorded with *applied*
+        so a dispatcher can tell a pick the session took from one it could not.
+    :param applied: Whether the session was switched onto *picked_model*.
     """
     if decision_id is None:
         return
+    labels = {ROUTING_DECISION_LABEL_KEY: decision_id}
+    if picked_model is not None:
+        labels[ROUTING_PICKED_MODEL_LABEL_KEY] = picked_model
+        labels[ROUTING_APPLIED_LABEL_KEY] = "1" if applied else "0"
     try:
-        await asyncio.to_thread(
-            conversation_store.set_labels,
-            session_id,
-            {ROUTING_DECISION_LABEL_KEY: decision_id},
-        )
+        await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
     except (OSError, ValueError):
         _logger.warning(
             "smart_routing: failed to label routing decision for session=%s",
@@ -9366,7 +9460,9 @@ async def _dispatch_session_event_to_runner_impl(
                 and subagent_routing_enabled(_native_parent_conv.subagent_routing_override)
             )
         _native_routing_enabled = (
-            conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
+            conv.cost_control_mode_override == "on"
+            and conv.parent_conversation_id is None
+            and not pinned_brain_session(conv)
         ) or _native_parent_routing_on
         _native_routed_model: str | None = None
         _native_verdict: dict[str, Any] | None = None
@@ -9381,8 +9477,11 @@ async def _dispatch_session_event_to_runner_impl(
         # pane cannot take must not become ``model_override``, which would
         # disable routing for every later turn and misattribute usage.
         _native_applied_model: str | None = None
-        if _native_routing_enabled and (
-            conv.model_override is None or conv.parent_conversation_id is not None
+        _native_report: dict[str, Any] | None = None
+        if (
+            _native_routing_enabled
+            and not (conv.labels.get(EXPLICIT_MODEL_LABEL_KEY) and conv.model_override is not None)
+            and (conv.model_override is None or conv.parent_conversation_id is not None)
         ):
             from omnigent.server.smart_routing import route_turn_or_decline
 
@@ -9531,7 +9630,16 @@ async def _dispatch_session_event_to_runner_impl(
                 # claim it — one outage would otherwise stop this pane's
                 # in-harness hook from ever routing.
                 await _stamp_routing_decision_label(
-                    session_id, conversation_store, _native_decision_id
+                    session_id,
+                    conversation_store,
+                    _native_decision_id,
+                    picked_model=_native_routed_model,
+                    applied=_native_applied_model is not None,
+                )
+                _native_report = _routing_report(
+                    _native_routed_model,
+                    _native_applied_model is not None,
+                    conv.model_override,
                 )
             if _native_parent_routing_on and conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
@@ -9544,9 +9652,12 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
                 )
-        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+        return _SessionEventDispatchResult(
+            item_id=None, pending_id=pending_id, model_routing=_native_report
+        )
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
         return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
+    routing_report: dict[str, Any] = {}
     item_id = await _forward_event_to_runner(
         session_id,
         conv,
@@ -9561,8 +9672,11 @@ async def _dispatch_session_event_to_runner_impl(
         host_store=host_store,
         agent_revision=agent_revision,
         startup_input_id=startup_input.input_id if startup_input is not None else None,
+        routing_out=routing_report,
     )
-    return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+    return _SessionEventDispatchResult(
+        item_id=item_id, pending_id=None, model_routing=routing_report or None
+    )
 
 
 # Sized to the runner liveness lease so the relay give-up, the disconnect
@@ -12482,18 +12596,137 @@ def _spec_routes_its_own_harness(
         return False
     if body.parent_session_id is not None or body.sub_agent_name is not None:
         return False
-    if agent_cache is None:
+    return _spec_brain_routing(agent, agent_cache) == AUTO_HARNESS_SENTINEL
+
+
+def _spec_starts_routing_on(
+    body: SessionCreateInput,
+    agent: Agent,
+    agent_cache: AgentCache | None,
+) -> bool:
+    """Whether this create takes the spec's ``smart_routing_default: on``.
+
+    Only a top-level create the caller left routing unset on: an explicit
+    ``off`` for either routing switch wins, and a child follows its parent's
+    subagent-routing switch instead.
+
+    :param body: The validated create request.
+    :param agent: The bound agent row.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: ``True`` when ``cost_control_mode_override`` must become ``"on"``.
+    :raises OmnigentError: ``invalid_input`` when the spec's value is invalid.
+    """
+    if body.cost_control_mode_override is not None or body.subagent_routing_override == "off":
         return False
-    try:
-        loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+    if body.parent_session_id is not None or body.sub_agent_name is not None:
+        return False
+    spec = _routing_spec(agent, agent_cache)
+    return spec is not None and _validated_spec_smart_routing_default(spec)
+
+
+def _bundle_spec_starts_routing_on(metadata: SessionCreateMetadata, spec: AgentSpec) -> bool:
+    """Whether an uploaded bundle's top-level session takes ``smart_routing_default: on``.
+
+    An upload carries no routing override of its own, so only a top-level
+    create is considered; a child upload follows its parent's switch.
+
+    :param metadata: Validated session metadata for the upload.
+    :param spec: The uploaded bundle's validated spec.
+    :returns: ``True`` when the new session's ``cost_control_mode_override`` must be ``"on"``.
+    :raises OmnigentError: ``invalid_input`` when the spec's value is invalid.
+    """
+    if metadata.parent_session_id is not None:
+        return False
+    return _validated_spec_smart_routing_default(spec)
+
+
+def _spec_pins_its_brain(
+    body: SessionCreateInput,
+    agent: Agent,
+    agent_cache: AgentCache | None,
+) -> bool:
+    """Whether this create is a brain the spec keeps out of Smart Routing.
+
+    ``smart_routing_harness: pinned`` keeps the brain on its declared harness
+    and model while its declared workers are routed. Only a top-level create
+    is a brain, and it is never re-routed: a ``harness_override: auto`` that
+    would hand it to the router is refused.
+
+    :param body: The validated create request.
+    :param agent: The bound agent row.
+    :param agent_cache: Cache for loading the agent's parsed spec.
+    :returns: ``True`` when the new session must carry the pinned-brain label.
+    :raises OmnigentError: ``invalid_input`` for ``harness_override: auto`` on
+        a pinned-brain spec.
+    """
+    if body.parent_session_id is not None or body.sub_agent_name is not None:
+        return False
+    if _spec_brain_routing(agent, agent_cache) != PINNED_BRAIN_VALUE:
+        return False
+    if body.harness_override == AUTO_HARNESS_SENTINEL:
+        raise OmnigentError(
+            f"agent {agent.name!r} pins its brain harness under Smart Routing "
+            "(executor.config.smart_routing_harness: pinned), so harness_override "
+            "'auto' cannot apply; pick a harness or omit harness_override.",
+            code=ErrorCode.INVALID_INPUT,
         )
-    except (KeyError, AttributeError, ValueError, ImportError, OSError):
-        # An unloadable spec just means "no opt-in"; the create's own
-        # validation reports it.
-        _logger.debug("create-time routing: agent %r failed to load", agent.name, exc_info=True)
-        return False
-    return _validated_spec_smart_routing_harness(loaded.spec) is not None
+    return True
+
+
+def _declared_worker_harnesses(
+    body: SessionCreateInput,
+    agent: Agent,
+    parent: Conversation | None,
+    agent_cache: AgentCache | None,
+) -> frozenset[str]:
+    """Harness a pinned-brain parent's bundle declares for this child.
+
+    Only a named sub-agent of the parent's own bundle counts, on the harness
+    its spec declares. Any other child of a pinned-brain parent keeps the
+    ordinary family rule.
+
+    :param body: The validated child create request.
+    :param agent: The agent row the child is created from.
+    :param parent: The parent session's row, or ``None``.
+    :param agent_cache: Cache for loading the parsed bundle.
+    :returns: The canonical declared harness, empty when the rule does not
+        apply.
+    """
+    if parent is None or not body.sub_agent_name or not pinned_brain_session(parent):
+        return frozenset()
+    if parent.agent_id != agent.id:
+        return frozenset()
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.models.model_catalog import spec_harness
+
+    sub_spec = _resolve_subagent_spec(
+        agent=agent, sub_agent_name=body.sub_agent_name, agent_cache=agent_cache
+    )
+    declared = spec_harness(sub_spec) if sub_spec is not None else None
+    if not declared:
+        return frozenset()
+    return frozenset({canonicalize_harness(declared) or declared})
+
+
+def _authorizes_pinned_brain_worker(
+    body: SessionCreateInput,
+    declared_worker_harnesses: frozenset[str],
+) -> bool:
+    """Whether this child create runs a pinned-brain worker as declared.
+
+    :param body: The validated child create request.
+    :param declared_worker_harnesses: From :func:`_declared_worker_harnesses`
+        for this create; empty when the child is no declared worker of a
+        pinned-brain parent.
+    :returns: ``True`` when the child runs on its worker's declared harness,
+        i.e. with no harness override or one naming that same harness.
+    """
+    if not declared_worker_harnesses or not body.harness_override:
+        return bool(declared_worker_harnesses)
+    from omnigent.harness_aliases import canonicalize_harness
+
+    override = canonicalize_harness(body.harness_override) or body.harness_override
+    return override in declared_worker_harnesses
 
 
 def _spawn_pins_its_harness(
@@ -12882,6 +13115,11 @@ async def _create_session_from_existing_agent(
         conversation_store=conversation_store,
     )
 
+    # ``smart_routing_default: on``: the session starts as if the caller had
+    # turned Smart Routing on, so every create path below sees one request.
+    if await asyncio.to_thread(_spec_starts_routing_on, body, agent, agent_cache):
+        body = body.model_copy(update={"cost_control_mode_override": "on"})
+
     # Top-level Smart Routing: "auto" on a native wrapper agent means the client
     # picked Smart Routing with no bundle agent, and its ``agent_id`` is only a
     # placeholder. Route now (the terminal launches with the row, so there is no
@@ -12940,9 +13178,14 @@ async def _create_session_from_existing_agent(
     _spec_auto_brain = not _native_smart_routing and await asyncio.to_thread(
         _spec_routes_its_own_harness, body, agent, agent_cache
     )
+    # ``smart_routing_harness: pinned``: the brain keeps its model, so nothing
+    # is routed at create either.
+    _spec_pinned_brain = not _native_smart_routing and await asyncio.to_thread(
+        _spec_pins_its_brain, body, agent, agent_cache
+    )
     _fixed_native_harness = (
         None
-        if _native_smart_routing or _spec_auto_brain
+        if _native_smart_routing or _spec_auto_brain or _spec_pinned_brain
         else await asyncio.to_thread(_fixed_native_routing_harness, body, agent, agent_cache)
     )
     _fixed_routed_model: str | None = None
@@ -13043,8 +13286,13 @@ async def _create_session_from_existing_agent(
     # applied codex verdict while running pi, and a ``claude-native`` worker
     # lost its terminal labels (skipped for forced-auto children below). Those
     # children route in their own family instead.
+    # The label only counts alongside a model: without one there is nothing to keep.
+    _explicit_model = model_override is not None and bool(
+        (body.labels or {}).get(EXPLICIT_MODEL_LABEL_KEY)
+    )
     _force_auto_for_child = False
     _parent_for_routing: Conversation | None = None
+    _pinned_brain_worker = False
     if body.parent_session_id is not None:
         _parent_for_routing = await asyncio.to_thread(
             conversation_store.get_conversation, body.parent_session_id
@@ -13053,6 +13301,7 @@ async def _create_session_from_existing_agent(
             _parent_for_routing is not None
             and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
             and auto_harness_session(_parent_for_routing)
+            and not _explicit_model
             and not await asyncio.to_thread(_spawn_pins_its_harness, body, agent, agent_cache)
         ):
             try:
@@ -13067,12 +13316,17 @@ async def _create_session_from_existing_agent(
         # rather than created and declined afterwards. Auto parents are
         # unaffected (the router owns their family) and so is a parent that
         # routes no spawns — neither resolves the child's harness at all.
+        _worker_harnesses = await asyncio.to_thread(
+            _declared_worker_harnesses, body, agent, _parent_for_routing, agent_cache
+        )
+        _pinned_brain_worker = _authorizes_pinned_brain_worker(body, _worker_harnesses)
         if _pinned_spawn_family(_parent_for_routing) is not None:
             _reject_out_of_family_child(
                 _parent_for_routing,
                 await asyncio.to_thread(
                     _create_resolved_harness, agent, body.harness_override, agent_cache
                 ),
+                _worker_harnesses,
             )
 
     # A session that starts on Smart Routing routes the subagents it spawns.
@@ -13111,15 +13365,21 @@ async def _create_session_from_existing_agent(
         # "auto" behind would make the first message re-route an already-running
         # terminal. The auto marker is stamped as a label below instead.
         harness_override = None
-    elif _force_auto_for_child or _spec_auto_brain or body.harness_override == "auto":
+    elif not _explicit_model and (
+        _force_auto_for_child or _spec_auto_brain or body.harness_override == "auto"
+    ):
         await asyncio.to_thread(_validated_harness_override_executor_type, agent)
         harness_override = "auto"
-        # Ignore any orchestrator-supplied model; routing picks it. (The spec
-        # opt-in never reaches here with a client model, so none is dropped.)
+        # Ignore any orchestrator-supplied model; routing picks it.
         model_override = None
     else:
+        # An explicit model is never re-decided, so "auto" (which re-routes the
+        # harness and model on the first message) is dropped: the child runs the
+        # spec's own harness, or the one the dispatch pinned, on the named model.
         harness_override = await asyncio.to_thread(
-            _validated_harness_override, body.harness_override, agent
+            _validated_harness_override,
+            None if _explicit_model and body.harness_override == "auto" else body.harness_override,
+            agent,
         )
 
     inference_snapshot = None
@@ -13537,6 +13797,10 @@ async def _create_session_from_existing_agent(
         from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
 
         initial_labels[AUTO_HARNESS_LABEL_KEY] = "1"
+    elif _spec_pinned_brain:
+        initial_labels[PINNED_BRAIN_LABEL_KEY] = "1"
+    if _pinned_brain_worker and body.parent_session_id is not None:
+        initial_labels[PINNED_BRAIN_WORKER_LABEL_KEY] = body.parent_session_id
     # A managed create's chosen sandbox host id is born with the row: the caller
     # routes the session by it until the host binds, and a sidebar list read
     # racing the create must never return the row without it.
@@ -13922,6 +14186,19 @@ def _create_session_from_bundle(
         )
         metadata = metadata.model_copy(update={"reasoning_effort": seeded_effort})
 
+    # An uploaded bundle's top-level session is a pinned brain, as on any other
+    # create. An invalid value is left to the routing create that reports it.
+    try:
+        _bundle_pins_brain = _validated_spec_smart_routing_harness(spec) == PINNED_BRAIN_VALUE
+    except OmnigentError:
+        _bundle_pins_brain = False
+    if metadata.parent_session_id is None and _bundle_pins_brain:
+        metadata = metadata.model_copy(
+            update={"labels": {**(metadata.labels or {}), PINNED_BRAIN_LABEL_KEY: "1"}}
+        )
+    bundle_cost_control_mode_override = (
+        "on" if _bundle_spec_starts_routing_on(metadata, spec) else None
+    )
     if metadata.parent_session_id is not None:
         try:
             terminal_launch_args = _derive_terminal_launch_args_from_spec(spec)
@@ -13964,6 +14241,7 @@ def _create_session_from_bundle(
                 inference_snapshot=inference_snapshot,
                 inference_model=inference_model,
                 git_branch=git_branch,
+                cost_control_mode_override=bundle_cost_control_mode_override,
             )
 
     agent_id = generate_agent_id()
@@ -13989,6 +14267,7 @@ def _create_session_from_bundle(
         inference_model=inference_model,
         git_branch=git_branch,
         created_by=created_by,
+        cost_control_mode_override=bundle_cost_control_mode_override,
     )
 
 

@@ -75,6 +75,7 @@ from omnigent.runner.journal_tools import (
     server_workflows_enabled,
 )
 from omnigent.runner.session_requests import remember_session_host
+from omnigent.runner.subagent_routing import EXPLICIT_MODEL_LABEL_KEY
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MEMORY_TOOL_NAMES
 from omnigent.tools import ToolManager
@@ -1989,6 +1990,35 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+def _routed_model_report(
+    msg_resp: httpx.Response,
+    requested_model: str | None,
+) -> _JsonObject | None:
+    """
+    Describe the Smart Routing decision the server made for one message POST.
+
+    :param msg_resp: The accepted response of the child message POST.
+    :param requested_model: The model the dispatch named, or ``None``.
+    :returns: ``{"requested_model", "model", "routed", "picked_model"}``, where
+        ``model`` is what the child runs on and ``routed`` is whether the pick
+        was applied; ``None`` when the response carries no decision (nothing
+        routed, an older server, or an unreadable body).
+    """
+    try:
+        body = _string_object_dict(msg_resp.json())
+    except ValueError:
+        return None
+    decision = _string_object_dict(body.get("model_routing")) if body is not None else None
+    if decision is None or not isinstance(decision.get("picked_model"), str):
+        return None
+    return {
+        "requested_model": requested_model,
+        "model": decision.get("model"),
+        "routed": decision.get("applied") is not False,
+        "picked_model": decision["picked_model"],
+    }
+
+
 async def _inherited_parent_model(
     *,
     server_client: httpx.AsyncClient,
@@ -3024,12 +3054,13 @@ async def _execute_subagent_tool(
         # Create child session on the server (no initial items —
         # those go via a separate POST so the server forwards them
         # to the runner and triggers a turn).
+        dispatch_labels: dict[str, str] = {_subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id}
         create_body: _JsonObject = {
             "agent_id": parent_agent_id,
             "parent_session_id": conversation_id,
             "title": f"{sub_agent_name}:{session_name}",
             "sub_agent_name": sub_agent_name,
-            "labels": {_subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: work_id},
+            "labels": dispatch_labels,
         }
         if harness_override_canonical is not None:
             create_body["harness_override"] = harness_override_canonical
@@ -3059,6 +3090,8 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
+            # Tells the server's Smart Routing to leave this model alone.
+            dispatch_labels[EXPLICIT_MODEL_LABEL_KEY] = "1"
         else:
             # No explicit per-dispatch model: inherit the parent session's
             # selection so the user's chosen model governs the whole session
@@ -3338,18 +3371,21 @@ async def _execute_subagent_tool(
 
     # Return the structured handle mirrored from ``spawn.py``. The debug panel
     # parses this to discover child sessions in the sidebar.
-    return json.dumps(
-        {
-            "task_id": child_session_id,
-            "handle_id": child_session_id,
-            "conversation_id": child_session_id,
-            "kind": "sub_agent",
-            "agent": sub_agent_name,
-            "title": session_name,
-            "status": "launching",
-            "message": _subagent_launching_message(sub_agent_name, session_name, child_session_id),
-        }
-    )
+    handle: _JsonObject = {
+        "task_id": child_session_id,
+        "handle_id": child_session_id,
+        "conversation_id": child_session_id,
+        "kind": "sub_agent",
+        "agent": sub_agent_name,
+        "title": session_name,
+        "status": "launching",
+        "message": _subagent_launching_message(sub_agent_name, session_name, child_session_id),
+    }
+    # Smart Routing may have picked the model; say so rather than let it differ silently.
+    routing = _routed_model_report(msg_resp, model)
+    if routing is not None:
+        handle["model_routing"] = routing
+    return json.dumps(handle)
 
 
 async def _send_to_existing_session(
@@ -3508,18 +3544,20 @@ async def _send_to_existing_session(
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
 
-    return json.dumps(
-        {
-            "task_id": target_session_id,
-            "handle_id": target_session_id,
-            "conversation_id": target_session_id,
-            "kind": "sub_agent",
-            "agent": agent_label,
-            "title": instance_title,
-            "status": "launching",
-            "message": _subagent_launching_message(agent_label, instance_title, target_session_id),
-        }
-    )
+    handle: _JsonObject = {
+        "task_id": target_session_id,
+        "handle_id": target_session_id,
+        "conversation_id": target_session_id,
+        "kind": "sub_agent",
+        "agent": agent_label,
+        "title": instance_title,
+        "status": "launching",
+        "message": _subagent_launching_message(agent_label, instance_title, target_session_id),
+    }
+    routing = _routed_model_report(msg_resp, None)
+    if routing is not None:
+        handle["model_routing"] = routing
+    return json.dumps(handle)
 
 
 # The created session exists, and a transport error can hide whether its

@@ -4196,6 +4196,9 @@ def register_events_routes(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
+        # Additive: the routing decision this very request made, if any.
+        if dispatch.model_routing is not None:
+            response["model_routing"] = dispatch.model_routing
         return response
 
     if register_startup_dispatch is not None:

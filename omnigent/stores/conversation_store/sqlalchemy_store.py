@@ -107,8 +107,11 @@ from omnigent.session_recovery import (
     reject_recovery_labels,
 )
 from omnigent.stores.conversation_store import (
+    _AUTO_HARNESS_LABEL_KEY,
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    _NEVER_COPIED_ROUTING_LABEL_KEYS,
+    _PINNED_BRAIN_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
@@ -6452,6 +6455,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         model_override: str | None = None,
+        cost_control_mode_override: str | None = None,
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
@@ -6529,6 +6533,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels=labels,
             reasoning_effort=reasoning_effort,
             model_override=model_override,
+            cost_control_mode_override=cost_control_mode_override,
             workspace=workspace,
             git_branch=git_branch,
             terminal_launch_args=terminal_launch_args,
@@ -6552,6 +6557,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         model_override: str | None = None,
+        cost_control_mode_override: str | None = None,
         workspace: str | None = None,
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
@@ -6572,6 +6578,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             {
                 "reasoning_effort": reasoning_effort,
                 "model_override": model_override,
+                "cost_control_mode_override": cost_control_mode_override,
             }
         )
         encoded_inference_snapshot = (
@@ -6978,6 +6985,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # An explicit dialog pick (override_*_set) supersedes the inherited
             # value — the fork dialog seeds the picker from the source, so an
             # untouched picker sends nothing and inheritance stands.
+            # The server stamps the pinned-brain label only from the copy's own
+            # agent spec; such a copy must not be handed to the router.
+            copy_pins_brain = (extra_labels or {}).get(_PINNED_BRAIN_LABEL_KEY) == "1"
             fork_effort = (
                 override_reasoning_effort
                 if override_reasoning_effort_set
@@ -6992,8 +7002,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                 {
                     "reasoning_effort": fork_effort,
                     "model_override": fork_model,
+                    # A copy the server pins as a brain never keeps the auto
+                    # sentinel that would hand that brain to the router.
                     "harness_override": (
-                        source_overrides["harness_override"] if copy_model_settings else None
+                        source_overrides["harness_override"]
+                        if copy_model_settings
+                        and not (
+                            copy_pins_brain and source_overrides["harness_override"] == "auto"
+                        )
+                        else None
                     ),
                     # A continuation is the same chat in the same workspace, shared
                     # exactly as its source, so the file-sharing opt-in carries over.
@@ -7352,6 +7369,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 not in (
                     _INSTANCE_SCOPED_LABEL_KEYS
                     | _FORK_ONLY_DROPPED_LABEL_KEYS
+                    | _NEVER_COPIED_ROUTING_LABEL_KEYS
+                    | ({_AUTO_HARNESS_LABEL_KEY} if copy_pins_brain else frozenset())
                     | dropped_label_keys
                 )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")

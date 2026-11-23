@@ -40,6 +40,7 @@ from omnigent.policies.schema import (
     SESSION_COST_UNPRICED_APPROVED_KEY,
 )
 from omnigent.policies.types import PolicyLLMClient
+from omnigent.runner.subagent_routing import ROUTING_PRIVILEGE_LABEL_KEYS
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import (
@@ -1159,7 +1160,9 @@ def _seed_and_load_labels(
     to_seed = {
         key: ldef.initial
         for key, ldef in label_defs.items()
-        if ldef.initial is not None and key not in existing
+        if ldef.initial is not None
+        and key not in existing
+        and key not in ROUTING_PRIVILEGE_LABEL_KEYS
     }
     if to_seed:
         conversation_store.set_labels(conversation_id, to_seed)
