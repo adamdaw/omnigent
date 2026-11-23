@@ -75,12 +75,7 @@ from omnigent.runner.journal_tools import (
     server_workflows_enabled,
 )
 from omnigent.runner.session_requests import remember_session_host
-from omnigent.runner.subagent_routing import (
-    EXPLICIT_MODEL_LABEL_KEY,
-    ROUTING_APPLIED_LABEL_KEY,
-    ROUTING_DECISION_LABEL_KEY,
-    ROUTING_PICKED_MODEL_LABEL_KEY,
-)
+from omnigent.runner.subagent_routing import EXPLICIT_MODEL_LABEL_KEY
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MEMORY_TOOL_NAMES
 from omnigent.tools import ToolManager
@@ -1995,59 +1990,32 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
-async def _child_routing_snapshot(
-    server_client: httpx.AsyncClient,
-    child_session_id: str,
-) -> _JsonObject | None:
-    """
-    Read a child's session snapshot, or ``None`` when it cannot be read.
-
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :param child_session_id: The child session to read.
-    :returns: The snapshot object; ``None`` on a transport, status or decode failure.
-    """
-    try:
-        resp = await _get_session_metadata(server_client, child_session_id, timeout=10.0)
-        return _string_object_dict(resp.json()) if resp.status_code == 200 else None
-    except (httpx.HTTPError, ValueError, RuntimeError):
-        return None
-
-
-def _routing_labels(snapshot: _JsonObject | None) -> _JsonObject:
-    """Return the snapshot's labels, empty when absent or malformed."""
-    return _string_object_dict(snapshot.get("labels")) or {} if snapshot is not None else {}
-
-
-async def _routed_model_report(
-    server_client: httpx.AsyncClient,
-    child_session_id: str,
+def _routed_model_report(
+    msg_resp: httpx.Response,
     requested_model: str | None,
-    *,
-    decision_before: object,
 ) -> _JsonObject | None:
     """
-    Describe a Smart Routing decision made while a message was sent to a child.
+    Describe the Smart Routing decision the server made for one message POST.
 
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :param child_session_id: The child session the message was sent to.
+    :param msg_resp: The accepted response of the child message POST.
     :param requested_model: The model the dispatch named, or ``None``.
-    :param decision_before: The child's routing decision id before the send
-        (``None`` for a new child); an unchanged id means nothing routed now.
     :returns: ``{"requested_model", "model", "routed", "picked_model"}``, where
         ``model`` is what the child runs on and ``routed`` is whether the pick
-        was applied; ``None`` when no decision was made or the child is unreadable.
+        was applied; ``None`` when the response carries no decision (nothing
+        routed, an older server, or an unreadable body).
     """
-    snapshot = await _child_routing_snapshot(server_client, child_session_id)
-    labels = _routing_labels(snapshot)
-    decision = labels.get(ROUTING_DECISION_LABEL_KEY)
-    if snapshot is None or not decision or decision == decision_before:
+    try:
+        body = _string_object_dict(msg_resp.json())
+    except ValueError:
         return None
-    actual = snapshot.get("model_override")
+    decision = _string_object_dict(body.get("model_routing")) if body is not None else None
+    if decision is None or not isinstance(decision.get("picked_model"), str):
+        return None
     return {
         "requested_model": requested_model,
-        "model": actual,
-        "routed": labels.get(ROUTING_APPLIED_LABEL_KEY) != "0",
-        "picked_model": labels.get(ROUTING_PICKED_MODEL_LABEL_KEY) or actual,
+        "model": decision.get("model"),
+        "routed": decision.get("applied") is not False,
+        "picked_model": decision["picked_model"],
     }
 
 
@@ -3368,11 +3336,6 @@ async def _execute_subagent_tool(
     message_content = copy_result.content
     assert message_content is not None
 
-    # A continuation may route on this send; note the decision it already has.
-    # Unreadable beforehand means an old decision could pass for a new one.
-    routing_before = (
-        None if created_child else await _child_routing_snapshot(server_client, child_session_id)
-    )
     # Send the user message as a separate event so the server's
     # post_event forwards it to the runner and starts the child
     # turn.
@@ -3419,16 +3382,7 @@ async def _execute_subagent_tool(
         "message": _subagent_launching_message(sub_agent_name, session_name, child_session_id),
     }
     # Smart Routing may have picked the model; say so rather than let it differ silently.
-    routing = (
-        await _routed_model_report(
-            server_client,
-            child_session_id,
-            model,
-            decision_before=_routing_labels(routing_before).get(ROUTING_DECISION_LABEL_KEY),
-        )
-        if created_child or routing_before is not None
-        else None
-    )
+    routing = _routed_model_report(msg_resp, model)
     if routing is not None:
         handle["model_routing"] = routing
     return json.dumps(handle)
@@ -3590,18 +3544,20 @@ async def _send_to_existing_session(
             f"Error: failed to send message to child: {msg_resp.status_code} {msg_resp.text[:200]}"
         )
 
-    return json.dumps(
-        {
-            "task_id": target_session_id,
-            "handle_id": target_session_id,
-            "conversation_id": target_session_id,
-            "kind": "sub_agent",
-            "agent": agent_label,
-            "title": instance_title,
-            "status": "launching",
-            "message": _subagent_launching_message(agent_label, instance_title, target_session_id),
-        }
-    )
+    handle: _JsonObject = {
+        "task_id": target_session_id,
+        "handle_id": target_session_id,
+        "conversation_id": target_session_id,
+        "kind": "sub_agent",
+        "agent": agent_label,
+        "title": instance_title,
+        "status": "launching",
+        "message": _subagent_launching_message(agent_label, instance_title, target_session_id),
+    }
+    routing = _routed_model_report(msg_resp, None)
+    if routing is not None:
+        handle["model_routing"] = routing
+    return json.dumps(handle)
 
 
 # The created session exists, and a transport error can hide whether its

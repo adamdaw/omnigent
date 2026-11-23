@@ -152,7 +152,11 @@ async def test_router_overrides_unnamed_inherited_child_model(
     assert refreshed.labels.get(ROUTING_PICKED_MODEL_LABEL_KEY) == ROUTED_MODEL
 
 
-async def _forward_first_child_message(child: Any, conv_store: SqlAlchemyConversationStore) -> Any:
+async def _forward_first_child_message(
+    child: Any,
+    conv_store: SqlAlchemyConversationStore,
+    routing_out: dict[str, Any] | None = None,
+) -> Any:
     caps = FakeCaps(
         routing_client=FakeRoutingClient(
             RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
@@ -165,7 +169,7 @@ async def _forward_first_child_message(child: Any, conv_store: SqlAlchemyConvers
     with patch("omnigent.runtime._globals._caps", new=caps):
         async with echo_runner_client() as runner_client:
             await orchestration_module._forward_event_to_runner(
-                child.id, child, body, conv_store, runner_client
+                child.id, child, body, conv_store, runner_client, routing_out=routing_out
             )
     refreshed = conv_store.get_conversation(child.id)
     assert refreshed is not None
@@ -186,12 +190,52 @@ async def test_explicit_child_model_beats_smart_routing(
     child = conv_store.get_conversation(child.id)
     assert child is not None
 
-    refreshed = await _forward_first_child_message(child, conv_store)
+    routing_out: dict[str, Any] = {}
+    refreshed = await _forward_first_child_message(child, conv_store, routing_out)
 
     # The model the caller named stays; the router is not consulted.
     assert refreshed.model_override == LLM_PICKED_MODEL
     assert _routing_decisions(conv_store, child.id) == []
     assert ROUTING_DECISION_LABEL_KEY not in refreshed.labels
+    assert routing_out == {}
+
+
+async def test_the_message_that_routes_reports_its_own_decision(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _parent, child, conv_store = await _parent_and_child(
+        client,
+        db_uri,
+        agent_name="routing-report-applied",
+        child_model_override=LLM_PICKED_MODEL,
+    )
+
+    routing_out: dict[str, Any] = {}
+    await _forward_first_child_message(child, conv_store, routing_out)
+
+    assert routing_out == {"picked_model": ROUTED_MODEL, "applied": True, "model": ROUTED_MODEL}
+
+
+async def test_a_continuation_that_is_already_routed_reports_nothing(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _parent, child, conv_store = await _parent_and_child(
+        client,
+        db_uri,
+        agent_name="routing-report-continuation",
+        child_model_override=LLM_PICKED_MODEL,
+    )
+    await _forward_first_child_message(child, conv_store)
+    routed = conv_store.get_conversation(child.id)
+    assert routed is not None
+
+    routing_out: dict[str, Any] = {}
+    await _forward_first_child_message(routed, conv_store, routing_out)
+
+    # The decision already on the row is not this request's, so it is not reported.
+    assert routing_out == {}
 
 
 async def test_another_spelling_of_the_routed_model_is_no_override(
@@ -2087,6 +2131,7 @@ async def _dispatch_native_turn(
     *,
     model: str,
     routing_client: Any = None,  # type: ignore[explicit-any]
+    results: list[Any] | None = None,  # type: ignore[explicit-any]
 ) -> tuple[Any, list[dict[str, Any]]]:
     """Send one web message into a native pane with the router returning *model*.
 
@@ -2095,6 +2140,7 @@ async def _dispatch_native_turn(
     :param model: Model the fake router picks for this turn.
     :param routing_client: Routing-client double to use, so a caller can read
         back what was offered. ``None`` builds one returning *model*.
+    :param results: Collects the dispatch result when given.
     :returns: The last routing-decision item's data and the forwarded bodies.
     """
     forwarded: list[dict[str, Any]] = []
@@ -2125,7 +2171,7 @@ async def _dispatch_native_turn(
                 new=AsyncMock(return_value=runner_client),
             ),
         ):
-            await orchestration_module._dispatch_session_event_to_runner_impl(
+            result = await orchestration_module._dispatch_session_event_to_runner_impl(
                 conv.id,
                 conv,
                 body,
@@ -2135,6 +2181,8 @@ async def _dispatch_native_turn(
                 file_store=None,
                 artifact_store=None,
             )
+            if results is not None:
+                results.append(result)
     decisions = _routing_decisions(conv_store, conv.id)
     return (decisions[-1].data if decisions else None), forwarded
 
@@ -3043,14 +3091,21 @@ async def test_native_decision_labels_record_whether_the_pick_was_applied(
     orchestration_module._model_options_cache[child.id] = [
         {"id": "opus", "model": ROUTED_MODEL},
     ]
+    results: list[Any] = []
     try:
-        await _dispatch_native_turn(child, conv_store, model=ROUTED_MODEL)
+        await _dispatch_native_turn(child, conv_store, model=ROUTED_MODEL, results=results)
         first = conv_store.get_conversation(child.id)
         assert first is not None
         # A second pick the pane cannot take is recorded, but not as applied.
-        await _dispatch_native_turn(first, conv_store, model=GPT_MODEL)
+        await _dispatch_native_turn(first, conv_store, model=GPT_MODEL, results=results)
     finally:
         orchestration_module._model_options_cache.pop(child.id, None)
+
+    # Each message's own response carries its decision.
+    assert [r.model_routing for r in results] == [
+        {"picked_model": ROUTED_MODEL, "applied": True, "model": ROUTED_MODEL},
+        {"picked_model": GPT_MODEL, "applied": False, "model": ROUTED_MODEL},
+    ]
 
     assert first.labels.get(ROUTING_APPLIED_LABEL_KEY) == "1"
     second = conv_store.get_conversation(child.id)

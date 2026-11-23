@@ -8198,6 +8198,7 @@ async def _forward_event_to_runner(
     host_store: HostStore | None = None,
     agent_revision: str | None = None,
     startup_input_id: str | None = None,
+    routing_out: dict[str, Any] | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -8231,6 +8232,8 @@ async def _forward_event_to_runner(
         ``None`` reads as unknown, which counts as backed.
     :param agent_revision: The agent's effective bundle and selection revision; the
         runner rebuilds the session's spec when it changes.
+    :param routing_out: Filled with this request's routing decision
+        (see :func:`_routing_report`) when it made one; left empty otherwise.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
@@ -8816,6 +8819,14 @@ async def _forward_event_to_runner(
                     picked_model=_auto_card_model,
                     applied=_auto_card_model == conv.model_override,
                 )
+                if routing_out is not None:
+                    routing_out.update(
+                        _routing_report(
+                            _auto_card_model,
+                            _auto_card_model == conv.model_override,
+                            conv.model_override,
+                        )
+                    )
             if conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
                     conv.parent_conversation_id,
@@ -8866,6 +8877,10 @@ async def _forward_event_to_runner(
                     picked_model=_routed_model,
                     applied=not _turn_unapplied,
                 )
+                if routing_out is not None:
+                    routing_out.update(
+                        _routing_report(_routed_model, not _turn_unapplied, _attempted_override)
+                    )
             # Mirror the routing decision into the parent session so the
             # orchestrator's transcript also shows which model was chosen
             # for this sub-agent — the decision is otherwise only visible
@@ -8901,6 +8916,23 @@ async def _forward_event_to_runner(
         ) from exc
 
     return persisted_items[0].id
+
+
+def _routing_report(picked_model: str, applied: bool, prior_model: str | None) -> dict[str, Any]:
+    """
+    Describe one routing decision for the message response.
+
+    :param picked_model: The model the router chose.
+    :param applied: Whether the session was switched onto it.
+    :param prior_model: The model the session ran on before the decision.
+    :returns: ``{"picked_model", "applied", "model"}``; ``model`` is what the
+        session runs on after the decision.
+    """
+    return {
+        "picked_model": picked_model,
+        "applied": applied,
+        "model": picked_model if applied else prior_model,
+    }
 
 
 async def _stamp_routing_decision_label(
@@ -9445,6 +9477,7 @@ async def _dispatch_session_event_to_runner_impl(
         # pane cannot take must not become ``model_override``, which would
         # disable routing for every later turn and misattribute usage.
         _native_applied_model: str | None = None
+        _native_report: dict[str, Any] | None = None
         if (
             _native_routing_enabled
             and not (conv.labels.get(EXPLICIT_MODEL_LABEL_KEY) and conv.model_override is not None)
@@ -9603,6 +9636,11 @@ async def _dispatch_session_event_to_runner_impl(
                     picked_model=_native_routed_model,
                     applied=_native_applied_model is not None,
                 )
+                _native_report = _routing_report(
+                    _native_routed_model,
+                    _native_applied_model is not None,
+                    conv.model_override,
+                )
             if _native_parent_routing_on and conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
                     conv.parent_conversation_id,
@@ -9614,9 +9652,12 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
                 )
-        return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+        return _SessionEventDispatchResult(
+            item_id=None, pending_id=pending_id, model_routing=_native_report
+        )
     if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
         return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
+    routing_report: dict[str, Any] = {}
     item_id = await _forward_event_to_runner(
         session_id,
         conv,
@@ -9631,8 +9672,11 @@ async def _dispatch_session_event_to_runner_impl(
         host_store=host_store,
         agent_revision=agent_revision,
         startup_input_id=startup_input.input_id if startup_input is not None else None,
+        routing_out=routing_report,
     )
-    return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
+    return _SessionEventDispatchResult(
+        item_id=item_id, pending_id=None, model_routing=routing_report or None
+    )
 
 
 # Sized to the runner liveness lease so the relay give-up, the disconnect
