@@ -75,7 +75,12 @@ from omnigent.runner.journal_tools import (
     server_workflows_enabled,
 )
 from omnigent.runner.session_requests import remember_session_host
-from omnigent.runner.subagent_routing import EXPLICIT_MODEL_LABEL_KEY, ROUTING_DECISION_LABEL_KEY
+from omnigent.runner.subagent_routing import (
+    EXPLICIT_MODEL_LABEL_KEY,
+    ROUTING_APPLIED_LABEL_KEY,
+    ROUTING_DECISION_LABEL_KEY,
+    ROUTING_PICKED_MODEL_LABEL_KEY,
+)
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MEMORY_TOOL_NAMES
 from omnigent.tools import ToolManager
@@ -1990,32 +1995,59 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+async def _child_routing_snapshot(
+    server_client: httpx.AsyncClient,
+    child_session_id: str,
+) -> _JsonObject | None:
+    """
+    Read a child's session snapshot, or ``None`` when it cannot be read.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param child_session_id: The child session to read.
+    :returns: The snapshot object; ``None`` on a transport, status or decode failure.
+    """
+    try:
+        resp = await _get_session_metadata(server_client, child_session_id, timeout=10.0)
+        return _string_object_dict(resp.json()) if resp.status_code == 200 else None
+    except (httpx.HTTPError, ValueError, RuntimeError):
+        return None
+
+
+def _routing_labels(snapshot: _JsonObject | None) -> _JsonObject:
+    """Return the snapshot's labels, empty when absent or malformed."""
+    return _string_object_dict(snapshot.get("labels")) or {} if snapshot is not None else {}
+
+
 async def _routed_model_report(
     server_client: httpx.AsyncClient,
     child_session_id: str,
     requested_model: str | None,
+    *,
+    decision_before: object,
 ) -> _JsonObject | None:
     """
-    Describe the model Smart Routing chose for a freshly dispatched child.
+    Describe a Smart Routing decision made while a message was sent to a child.
 
     :param server_client: HTTP client pointed at the Omnigent server.
-    :param child_session_id: The child session the first message was sent to.
+    :param child_session_id: The child session the message was sent to.
     :param requested_model: The model the dispatch named, or ``None``.
-    :returns: ``{"requested_model", "model", "routed": True}`` when the child
-        carries a routing decision, else ``None`` (not routed, or unreadable).
+    :param decision_before: The child's routing decision id before the send
+        (``None`` for a new child); an unchanged id means nothing routed now.
+    :returns: ``{"requested_model", "model", "routed", "picked_model"}``, where
+        ``model`` is what the child runs on and ``routed`` is whether the pick
+        was applied; ``None`` when no decision was made or the child is unreadable.
     """
-    try:
-        resp = await _get_session_metadata(server_client, child_session_id, timeout=10.0)
-    except (httpx.HTTPError, ValueError, RuntimeError):
+    snapshot = await _child_routing_snapshot(server_client, child_session_id)
+    labels = _routing_labels(snapshot)
+    decision = labels.get(ROUTING_DECISION_LABEL_KEY)
+    if snapshot is None or not decision or decision == decision_before:
         return None
-    snap = _string_object_dict(resp.json()) if resp.status_code == 200 else None
-    labels = _string_object_dict(snap.get("labels")) if snap is not None else None
-    if snap is None or labels is None or not labels.get(ROUTING_DECISION_LABEL_KEY):
-        return None
+    actual = snapshot.get("model_override")
     return {
         "requested_model": requested_model,
-        "model": snap.get("model_override"),
-        "routed": True,
+        "model": actual,
+        "routed": labels.get(ROUTING_APPLIED_LABEL_KEY) != "0",
+        "picked_model": labels.get(ROUTING_PICKED_MODEL_LABEL_KEY) or actual,
     }
 
 
@@ -3336,6 +3368,11 @@ async def _execute_subagent_tool(
     message_content = copy_result.content
     assert message_content is not None
 
+    # A continuation may route on this send; note the decision it already has.
+    # Unreadable beforehand means an old decision could pass for a new one.
+    routing_before = (
+        None if created_child else await _child_routing_snapshot(server_client, child_session_id)
+    )
     # Send the user message as a separate event so the server's
     # post_event forwards it to the runner and starts the child
     # turn.
@@ -3383,8 +3420,13 @@ async def _execute_subagent_tool(
     }
     # Smart Routing may have picked the model; say so rather than let it differ silently.
     routing = (
-        await _routed_model_report(server_client, child_session_id, model)
-        if created_child
+        await _routed_model_report(
+            server_client,
+            child_session_id,
+            model,
+            decision_before=_routing_labels(routing_before).get(ROUTING_DECISION_LABEL_KEY),
+        )
+        if created_child or routing_before is not None
         else None
     )
     if routing is not None:

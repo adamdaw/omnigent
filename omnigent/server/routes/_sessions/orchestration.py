@@ -111,7 +111,9 @@ from omnigent.runner.subagent_routing import (
     EXPLICIT_MODEL_LABEL_KEY,
     PINNED_BRAIN_LABEL_KEY,
     PINNED_BRAIN_WORKER_LABEL_KEY,
+    ROUTING_APPLIED_LABEL_KEY,
     ROUTING_DECISION_LABEL_KEY,
+    ROUTING_PICKED_MODEL_LABEL_KEY,
     auto_harness_session,
     declared_worker_of_pinned_brain,
     harness_family,
@@ -8535,7 +8537,9 @@ async def _forward_event_to_runner(
     )
     # A child whose dispatch named a model keeps it. An inherited parent model
     # carries no label, so it is still set aside by routing.
-    _explicit_child_model = bool(conv.labels.get(EXPLICIT_MODEL_LABEL_KEY))
+    _explicit_child_model = (
+        bool(conv.labels.get(EXPLICIT_MODEL_LABEL_KEY)) and conv.model_override is not None
+    )
     _should_route = (
         _routing_enabled
         and body.type == "message"
@@ -8806,7 +8810,11 @@ async def _forward_event_to_runner(
                 # create-time outage the reason nothing routes this session
                 # again. The card still shows what happened.
                 await _stamp_routing_decision_label(
-                    session_id, conversation_store, _auto_decision_id
+                    session_id,
+                    conversation_store,
+                    _auto_decision_id,
+                    picked_model=_auto_card_model,
+                    applied=_auto_card_model == conv.model_override,
                 )
             if conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
@@ -8851,7 +8859,13 @@ async def _forward_event_to_runner(
                 # label is the route-once gate, so stamping it would make one
                 # outage the reason the session never routes again. The card
                 # still shows what happened.
-                await _stamp_routing_decision_label(session_id, conversation_store, _decision_id)
+                await _stamp_routing_decision_label(
+                    session_id,
+                    conversation_store,
+                    _decision_id,
+                    picked_model=_routed_model,
+                    applied=not _turn_unapplied,
+                )
             # Mirror the routing decision into the parent session so the
             # orchestrator's transcript also shows which model was chosen
             # for this sub-agent — the decision is otherwise only visible
@@ -8893,6 +8907,9 @@ async def _stamp_routing_decision_label(
     session_id: str,
     conversation_store: ConversationStore,
     decision_id: str | None,
+    *,
+    picked_model: str | None = None,
+    applied: bool = True,
 ) -> None:
     """Record the decision behind a session's pinned model as a label.
 
@@ -8902,15 +8919,18 @@ async def _stamp_routing_decision_label(
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store exposing ``set_labels``.
     :param decision_id: Decision identity, or ``None`` to skip.
+    :param picked_model: The model the router picked; recorded with *applied*
+        so a dispatcher can tell a pick the session took from one it could not.
+    :param applied: Whether the session was switched onto *picked_model*.
     """
     if decision_id is None:
         return
+    labels = {ROUTING_DECISION_LABEL_KEY: decision_id}
+    if picked_model is not None:
+        labels[ROUTING_PICKED_MODEL_LABEL_KEY] = picked_model
+        labels[ROUTING_APPLIED_LABEL_KEY] = "1" if applied else "0"
     try:
-        await asyncio.to_thread(
-            conversation_store.set_labels,
-            session_id,
-            {ROUTING_DECISION_LABEL_KEY: decision_id},
-        )
+        await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
     except (OSError, ValueError):
         _logger.warning(
             "smart_routing: failed to label routing decision for session=%s",
@@ -9427,7 +9447,7 @@ async def _dispatch_session_event_to_runner_impl(
         _native_applied_model: str | None = None
         if (
             _native_routing_enabled
-            and not conv.labels.get(EXPLICIT_MODEL_LABEL_KEY)
+            and not (conv.labels.get(EXPLICIT_MODEL_LABEL_KEY) and conv.model_override is not None)
             and (conv.model_override is None or conv.parent_conversation_id is not None)
         ):
             from omnigent.server.smart_routing import route_turn_or_decline
@@ -9577,7 +9597,11 @@ async def _dispatch_session_event_to_runner_impl(
                 # claim it — one outage would otherwise stop this pane's
                 # in-harness hook from ever routing.
                 await _stamp_routing_decision_label(
-                    session_id, conversation_store, _native_decision_id
+                    session_id,
+                    conversation_store,
+                    _native_decision_id,
+                    picked_model=_native_routed_model,
+                    applied=_native_applied_model is not None,
                 )
             if _native_parent_routing_on and conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
@@ -13218,6 +13242,10 @@ async def _create_session_from_existing_agent(
     # applied codex verdict while running pi, and a ``claude-native`` worker
     # lost its terminal labels (skipped for forced-auto children below). Those
     # children route in their own family instead.
+    # The label only counts alongside a model: without one there is nothing to keep.
+    _explicit_model = model_override is not None and bool(
+        (body.labels or {}).get(EXPLICIT_MODEL_LABEL_KEY)
+    )
     _force_auto_for_child = False
     _parent_for_routing: Conversation | None = None
     _pinned_brain_worker = False
@@ -13229,7 +13257,7 @@ async def _create_session_from_existing_agent(
             _parent_for_routing is not None
             and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
             and auto_harness_session(_parent_for_routing)
-            and not (body.labels or {}).get(EXPLICIT_MODEL_LABEL_KEY)
+            and not _explicit_model
             and not await asyncio.to_thread(_spawn_pins_its_harness, body, agent, agent_cache)
         ):
             try:
@@ -13293,15 +13321,21 @@ async def _create_session_from_existing_agent(
         # "auto" behind would make the first message re-route an already-running
         # terminal. The auto marker is stamped as a label below instead.
         harness_override = None
-    elif _force_auto_for_child or _spec_auto_brain or body.harness_override == "auto":
+    elif not _explicit_model and (
+        _force_auto_for_child or _spec_auto_brain or body.harness_override == "auto"
+    ):
         await asyncio.to_thread(_validated_harness_override_executor_type, agent)
         harness_override = "auto"
-        # Ignore any orchestrator-supplied model; routing picks it. (The spec
-        # opt-in never reaches here with a client model, so none is dropped.)
+        # Ignore any orchestrator-supplied model; routing picks it.
         model_override = None
     else:
+        # An explicit model is never re-decided, so "auto" (which re-routes the
+        # harness and model on the first message) is dropped: the child runs the
+        # spec's own harness, or the one the dispatch pinned, on the named model.
         harness_override = await asyncio.to_thread(
-            _validated_harness_override, body.harness_override, agent
+            _validated_harness_override,
+            None if _explicit_model and body.harness_override == "auto" else body.harness_override,
+            agent,
         )
 
     inference_snapshot = None
