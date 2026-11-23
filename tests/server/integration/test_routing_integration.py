@@ -19,6 +19,7 @@ import pytest
 from omnigent.runner import subagent_routing
 from omnigent.runner.subagent_routing import (
     AUTO_HARNESS_LABEL_KEY,
+    EXPLICIT_MODEL_LABEL_KEY,
     PINNED_BRAIN_LABEL_KEY,
     PINNED_BRAIN_WORKER_LABEL_KEY,
     ROUTING_DECISION_LABEL_KEY,
@@ -98,10 +99,10 @@ def _routing_decisions(conv_store: SqlAlchemyConversationStore, session_id: str)
     ]
 
 
-# ── 1. Child spawn: the router wins over ``args.model`` ─────────────
+# ── 1. Child spawn: the router replaces an inherited model, not a named one ──
 
 
-async def test_router_overrides_llm_supplied_child_model(
+async def test_router_overrides_unnamed_inherited_child_model(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
@@ -132,7 +133,8 @@ async def test_router_overrides_llm_supplied_child_model(
 
     refreshed = conv_store.get_conversation(child.id)
     assert refreshed is not None
-    # The router's pick replaced the orchestrator's ``args.model``.
+    # No ``args.model`` was named (the label is absent), so the router's pick
+    # replaces the model the child inherited.
     assert refreshed.model_override == ROUTED_MODEL
     decisions = _routing_decisions(conv_store, child.id)
     assert len(decisions) == 1
@@ -143,10 +145,6 @@ async def test_router_overrides_llm_supplied_child_model(
     assert data.decision_id
     # The decision is joined onto the child row for the sidebar.
     assert refreshed.labels.get(ROUTING_DECISION_LABEL_KEY) == data.decision_id
-
-
-# Written by the dispatching runner when the caller named ``args.model``.
-_EXPLICIT_MODEL_LABEL = "omnigent.dispatch.explicit_model"
 
 
 async def _forward_first_child_message(child: Any, conv_store: SqlAlchemyConversationStore) -> Any:
@@ -179,7 +177,7 @@ async def test_explicit_child_model_beats_smart_routing(
         agent_name="explicit-model-wins",
         child_model_override=LLM_PICKED_MODEL,
     )
-    conv_store.set_labels(child.id, {_EXPLICIT_MODEL_LABEL: "1"})
+    conv_store.set_labels(child.id, {EXPLICIT_MODEL_LABEL_KEY: "1"})
     child = conv_store.get_conversation(child.id)
     assert child is not None
 

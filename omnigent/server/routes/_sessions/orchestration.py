@@ -108,6 +108,7 @@ from omnigent.runner.mcp_execution_registry import (
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
+    EXPLICIT_MODEL_LABEL_KEY,
     PINNED_BRAIN_LABEL_KEY,
     PINNED_BRAIN_WORKER_LABEL_KEY,
     ROUTING_DECISION_LABEL_KEY,
@@ -8532,12 +8533,13 @@ async def _forward_event_to_runner(
     _child_routed_before = conv.parent_conversation_id is not None and bool(
         conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     )
-    # For child sessions, route even when the orchestrator specified a model via
-    # sys_session_send (effective_runner_override is already set). Smart routing
-    # always wins over the LLM's own model choice when the parent toggle is on.
+    # A child whose dispatch named a model keeps it. An inherited parent model
+    # carries no label, so it is still set aside by routing.
+    _explicit_child_model = bool(conv.labels.get(EXPLICIT_MODEL_LABEL_KEY))
     _should_route = (
         _routing_enabled
         and body.type == "message"
+        and not _explicit_child_model
         # The auto-harness block above already routed this turn (harness +
         # model) — don't re-run the router for the same message.
         and not _auto_resolved_this_turn
@@ -8821,7 +8823,7 @@ async def _forward_event_to_runner(
             _decision_scope = "child_session" if _parent_routing_on else "turn"
             if _turn_unapplied:
                 _verdict = _unapplied_routed_verdict(_routed_model, _verdict)
-            # The router wins over the orchestrator's own pick; the attempt is
+            # The router wins over an inherited model; the attempt is
             # recorded so the UI can show what it overrode. Compared on the bare
             # arm, so another spelling of the same model (a spawn's
             # ``system.ai.glm-5-2`` against the router's ``databricks-glm-5-2``)
@@ -9423,8 +9425,10 @@ async def _dispatch_session_event_to_runner_impl(
         # pane cannot take must not become ``model_override``, which would
         # disable routing for every later turn and misattribute usage.
         _native_applied_model: str | None = None
-        if _native_routing_enabled and (
-            conv.model_override is None or conv.parent_conversation_id is not None
+        if (
+            _native_routing_enabled
+            and not conv.labels.get(EXPLICIT_MODEL_LABEL_KEY)
+            and (conv.model_override is None or conv.parent_conversation_id is not None)
         ):
             from omnigent.server.smart_routing import route_turn_or_decline
 
@@ -13225,6 +13229,7 @@ async def _create_session_from_existing_agent(
             _parent_for_routing is not None
             and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
             and auto_harness_session(_parent_for_routing)
+            and not (body.labels or {}).get(EXPLICIT_MODEL_LABEL_KEY)
             and not await asyncio.to_thread(_spawn_pins_its_harness, body, agent, agent_cache)
         ):
             try:
