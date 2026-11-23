@@ -145,6 +145,52 @@ async def test_router_overrides_llm_supplied_child_model(
     assert refreshed.labels.get(ROUTING_DECISION_LABEL_KEY) == data.decision_id
 
 
+# Written by the dispatching runner when the caller named ``args.model``.
+_EXPLICIT_MODEL_LABEL = "omnigent.dispatch.explicit_model"
+
+
+async def _forward_first_child_message(child: Any, conv_store: SqlAlchemyConversationStore) -> Any:
+    caps = FakeCaps(
+        routing_client=FakeRoutingClient(
+            RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
+        )
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                child.id, child, body, conv_store, runner_client
+            )
+    refreshed = conv_store.get_conversation(child.id)
+    assert refreshed is not None
+    return refreshed
+
+
+async def test_explicit_child_model_beats_smart_routing(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    _parent, child, conv_store = await _parent_and_child(
+        client,
+        db_uri,
+        agent_name="explicit-model-wins",
+        child_model_override=LLM_PICKED_MODEL,
+    )
+    conv_store.set_labels(child.id, {_EXPLICIT_MODEL_LABEL: "1"})
+    child = conv_store.get_conversation(child.id)
+    assert child is not None
+
+    refreshed = await _forward_first_child_message(child, conv_store)
+
+    # The model the caller named stays; the router is not consulted.
+    assert refreshed.model_override == LLM_PICKED_MODEL
+    assert _routing_decisions(conv_store, child.id) == []
+    assert ROUTING_DECISION_LABEL_KEY not in refreshed.labels
+
+
 async def test_another_spelling_of_the_routed_model_is_no_override(
     client: httpx.AsyncClient,
     db_uri: str,
