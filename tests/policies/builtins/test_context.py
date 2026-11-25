@@ -561,11 +561,36 @@ async def test_notes_context_lists_matching_notes_best_first(tmp_path: Path) -> 
     assert len(lines) == 2
 
 
+async def test_notes_context_ignores_words_common_to_every_note(tmp_path: Path) -> None:
+    from omnigent.policies.builtins.context import notes_context
+
+    for index in range(10):
+        (tmp_path / f"note-{index}.md").write_text(f"# Note {index}\nThe test file runs.\n")
+    policy = notes_context(paths=[str(tmp_path)])
+    assert await policy(_event("the failing test in this file")) is None
+
+
+async def test_notes_context_drops_matches_far_below_the_best(tmp_path: Path) -> None:
+    from omnigent.policies.builtins.context import notes_context
+
+    (tmp_path / "sonobus-latency.md").write_text(
+        "# SonoBus latency\nSonoBus audio over the cable.\n"
+    )
+    (tmp_path / "speakers.md").write_text("# Speakers\nDesk audio setup.\n")
+    (tmp_path / "unrelated.md").write_text("# Unrelated\nNothing here.\n")
+    policy = notes_context(paths=[str(tmp_path)], min_score=0.1)
+    result = await policy(_event("sonobus audio is choppy"))
+    assert result is not None
+    assert result["context"].splitlines()[1:] == [
+        f"- {tmp_path / 'sonobus-latency.md'} — SonoBus latency"
+    ]
+
+
 async def test_notes_context_summary_falls_back_to_heading(tmp_path: Path) -> None:
     from omnigent.policies.builtins.context import notes_context
 
     _write_notes(tmp_path)
-    policy = notes_context(paths=[str(tmp_path / "questions")], min_matches=2)
+    policy = notes_context(paths=[str(tmp_path / "questions")], min_score=1.0)
     result = await policy(_event("is the photo library indexed?"))
     assert result is not None
     assert result["context"].splitlines()[1].endswith("— Photo library")
@@ -576,7 +601,7 @@ async def test_notes_context_caps_results(tmp_path: Path) -> None:
 
     for index in range(4):
         (tmp_path / f"deploy-{index}.md").write_text("# Deploy\nDeploy the server with care.\n")
-    policy = notes_context(paths=[str(tmp_path)], max_results=2)
+    policy = notes_context(paths=[str(tmp_path)], max_results=2, min_score=1.0)
     result = await policy(_event("how do I deploy the server"))
     assert result is not None
     assert len(result["context"].splitlines()) == 3
@@ -608,7 +633,7 @@ async def test_notes_context_skips_missing_and_unreadable_paths(tmp_path: Path) 
 
     _write_notes(tmp_path)
     (tmp_path / "broken.md").symlink_to(tmp_path / "does-not-exist.md")
-    policy = notes_context(paths=[str(tmp_path / "missing"), str(tmp_path)])
+    policy = notes_context(paths=[str(tmp_path / "missing"), str(tmp_path)], min_score=1.0)
     result = await policy(_event("restic restore of the archive"))
     assert result is not None
     assert "backup-restore.md" in result["context"]

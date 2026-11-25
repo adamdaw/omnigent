@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Literal
@@ -359,6 +360,8 @@ _NOTE_STOPWORDS = frozenset(
 )
 _NOTE_SUMMARY_KEYS = ("question", "description", "title")
 _NOTE_SUMMARY_MAX_CHARS = 160
+# Notes scoring under this fraction of the best match are left out.
+_NOTE_RELATIVE_CUTOFF = 0.5
 
 
 def _note_query_terms(message: str) -> set[str]:
@@ -401,55 +404,75 @@ def _search_notes(
     terms: set[str],
     *,
     max_results: int,
-    min_matches: int,
+    min_score: float,
 ) -> list[str]:
     """
-    Rank markdown notes under *roots* by how many query terms they contain.
+    Rank markdown notes under *roots* by the rarity-weighted terms they contain.
 
-    A term found in the file name counts twice. Unreadable files are skipped.
+    Each matched term scores ``log(1 + notes / notes containing it)``, doubled
+    when it is in the file name, so a rare word outweighs common ones. Notes
+    below *min_score*, or below half the best note's score, are left out.
+    Unreadable files are skipped.
 
     :param roots: Note files or directories searched recursively for ``*.md``.
     :param terms: Search terms from :func:`_note_query_terms`.
     :param max_results: Maximum number of notes to return.
-    :param min_matches: Distinct terms a note must contain to be listed.
+    :param min_score: Score a note must reach to be listed.
     :returns: ``"- <path> — <summary>"`` lines, best match first.
     """
-    scored: list[tuple[int, str, str]] = []
+    notes: list[tuple[Path, str, str, str]] = []
     for root in roots:
-        notes = [root] if root.is_file() else sorted(root.rglob("*.md"))
-        for note in notes:
+        for note in [root] if root.is_file() else sorted(root.rglob("*.md")):
             try:
                 text = note.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            name, body = note.stem.lower(), text.lower()
-            matched = [term for term in terms if term in body or term in name]
-            if len(matched) < min_matches:
-                continue
-            score = len(matched) + sum(1 for term in matched if term in name)
+            notes.append((note, text, note.stem.lower(), text.lower()))
+    present = {
+        term: [term in name or term in body for _, _, name, body in notes] for term in terms
+    }
+    weight = {
+        term: math.log(1 + len(notes) / hits.count(True))
+        for term, hits in present.items()
+        if any(hits)
+    }
+    scored: list[tuple[float, str, str]] = []
+    for index, (note, text, name, _) in enumerate(notes):
+        score = sum(
+            term_weight * (2 if term in name else 1)
+            for term, term_weight in weight.items()
+            if present[term][index]
+        )
+        if score >= min_score:
             scored.append((score, str(note), _note_summary(note, text)))
+    if not scored:
+        return []
     scored.sort(key=lambda entry: (-entry[0], entry[1]))
-    return [f"- {path} — {summary}" for _, path, summary in scored[:max_results]]
+    cutoff = scored[0][0] * _NOTE_RELATIVE_CUTOFF
+    return [
+        f"- {path} — {summary}" for score, path, summary in scored[:max_results] if score >= cutoff
+    ]
 
 
 def notes_context(
     paths: list[str],
     max_results: int = 5,
-    min_matches: int = 2,
+    min_score: float = 6.0,
 ) -> PolicyCallable:
     """
     Point the model at local notes that look relevant to the user's message.
 
-    Searches markdown files under *paths* for the message's words and, when
-    any note matches enough of them, ALLOWs with a ``context`` list of note
-    paths and one-line summaries. The model is told the notes exist; it
-    reads them itself. Never blocks: on no match or any error it abstains.
+    Searches markdown files under *paths* for the message's words, weighting
+    rare words over common ones, and when notes score well enough ALLOWs with
+    a ``context`` list of note paths and one-line summaries. The model is told
+    the notes exist; it reads them itself. Never blocks: on no match or any
+    error it abstains.
 
     :param paths: Note files or directories, e.g. ``["~/notes/questions"]``.
         ``~`` is expanded; missing paths are skipped.
     :param max_results: Maximum notes to list. Defaults to 5.
-    :param min_matches: Distinct message words a note must contain.
-        Defaults to 2.
+    :param min_score: Score a note must reach to be listed. Defaults to 6.0,
+        roughly two words that each appear in under a tenth of the notes.
     :returns: An async policy callable that fires on ``request`` events.
     """
     roots = [Path(path).expanduser() for path in paths]
@@ -464,7 +487,7 @@ def notes_context(
         if event.get("type") != "request":
             return None
         terms = _note_query_terms(request_user_text(event.get("data")))
-        if len(terms) < min_matches:
+        if not terms:
             return None
         try:
             matches = await asyncio.to_thread(
@@ -472,7 +495,7 @@ def notes_context(
                 [root for root in roots if root.exists()],
                 terms,
                 max_results=max_results,
-                min_matches=min_matches,
+                min_score=min_score,
             )
         except Exception:  # noqa: BLE001 — fail-open: notes are a hint, never a gate
             _log.exception("notes_context: note search failed")
@@ -695,11 +718,13 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "default": 5,
                     "description": "Maximum notes to list. Defaults to 5.",
                 },
-                "min_matches": {
-                    "type": "integer",
-                    "default": 2,
+                "min_score": {
+                    "type": "number",
+                    "default": 6.0,
                     "description": (
-                        "Distinct message words a note must contain to be listed. Defaults to 2."
+                        "Score a note must reach to be listed. Each matched word scores "
+                        "log(1 + notes / notes containing it), doubled in the file name. "
+                        "Defaults to 6.0."
                     ),
                 },
             },
