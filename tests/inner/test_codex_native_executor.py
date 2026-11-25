@@ -2323,49 +2323,6 @@ def test_resize_notice_is_encoded_in_model_visible_image_path(
     assert len(start["input"]) == 2
 
 
-def test_text_notice_is_sent_after_the_user_text(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Codex has no hidden context channel, so a text notice is a separate trailing item."""
-    from omnigent.inner.native_attachments import text_notice_block
-
-    _FakeCodexNativeClient.requests = []
-    _FakeCodexNativeClient.next_turn = 1
-    monkeypatch.setattr(
-        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
-        _FakeCodexNativeClient,
-    )
-    _start_state(tmp_path)
-    executor = CodexNativeExecutor(bridge_dir=tmp_path)
-
-    async def run() -> None:
-        async for _ in executor.run_turn(
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        text_notice_block("See notes/deploy.md"),
-                        {"type": "input_text", "text": "how do I deploy"},
-                    ],
-                },
-            ],
-            [],
-            "",
-        ):
-            pass
-
-    asyncio.run(run())
-
-    start = next(
-        params for method, params in _FakeCodexNativeClient.requests if method == "turn/start"
-    )
-    assert start["input"] == [
-        {"type": "text", "text": "how do I deploy"},
-        {"type": "text", "text": "See notes/deploy.md"},
-    ]
-
-
 def test_resize_paths_preserve_multiple_images_and_cached_originals(tmp_path: Path) -> None:
     from omnigent.inner.codex_native_executor import _content_to_input_items
     from omnigent.inner.native_attachments import framework_notice_block

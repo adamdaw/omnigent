@@ -73,6 +73,7 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.inner.executor import NativeTurnAcceptance
+from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
@@ -885,11 +886,27 @@ _GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
 
 
 def _history_message_from_body(body: _JsonObject) -> _JsonObject:
-    """Preserve the persisted initiating item when recording an incoming message."""
+    """
+    Preserve the persisted initiating item when recording an incoming message.
+
+    One-shot text notices (request-policy context) are dropped so later turns
+    do not replay them; resize notices describe an image that stays, so they stay.
+    """
+    content = body.get("content", [])
+    if isinstance(content, list):
+        content = [
+            block
+            for block in content
+            if not (
+                isinstance(block, dict)
+                and block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE
+                and isinstance(block.get("text"), str)
+            )
+        ]
     return {
         "type": "message",
         "role": body.get("role", "user"),
-        "content": body.get("content", []),
+        "content": content,
         "id": body.get("persisted_item_id"),
     }
 

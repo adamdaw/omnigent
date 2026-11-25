@@ -7646,7 +7646,10 @@ async def _forward_native_terminal_message(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-    _append_policy_context_notice(event, body)
+    # Only Claude Code has a hidden context channel (its prompt hook). Others type
+    # every block, and Codex command detection needs the user's exact content.
+    if harness == "claude-native":
+        _append_policy_context_notice(event, body)
     forward_options: dict[str, Any] = {}
     if native_shell_authorized:
         from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER

@@ -1582,20 +1582,13 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     if isinstance(content, list):
         items: list[dict[str, object]] = []
         file_blocks: list[tuple[int, dict[str, object]]] = []
-        # Codex has no hidden context channel; text notices trail the user's input.
-        notice_items: list[dict[str, object]] = []
         for raw_block in content:
             block = _json_object(raw_block)
             if block is None:
                 continue
             block_type = block.get("type")
             if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
-                notice_text = block.get("text")
-                if isinstance(notice_text, str):
-                    if notice_text:
-                        notice_items.append({"type": "text", "text": notice_text})
-                else:
-                    _apply_resize_notice_to_latest_image(items, block.get("source_metadata"))
+                _apply_resize_notice_to_latest_image(items, block.get("source_metadata"))
                 continue
             if block_type in {"input_text", "text"}:
                 text = block.get("text")
@@ -1631,7 +1624,7 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
                 file_item = _file_block_to_input_item(block, bridge_dir, inline_text=False)
                 if file_item is not None:
                     items[index] = file_item
-        return items + notice_items
+        return items
     if content is None:
         return []
     return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]

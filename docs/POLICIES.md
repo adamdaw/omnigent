@@ -627,10 +627,11 @@ On `request` events an `ALLOW` may carry `"context": "<text>"` to give the model
 extra text beside the user's message, unlike `data`, which replaces it. Context
 from several policies is joined in order. It is model-only and never stored with
 the message, so it stays out of history, titles and routing. Web and API messages
-forward it to the runner as a framework notice: SDK agents get a system message,
-Claude Code gets hook context, and Codex gets a trailing text input. Prompts typed
-in a Claude Code or Codex terminal get it as hook `additionalContext`. DENY and ASK
-drop it, and skill slash commands do not carry it.
+forward it to the runner as a one-shot framework notice: SDK agents that expand
+notices get a system message, and Claude Code gets hook context. Other native
+terminals (Codex included) do not receive it from web messages, since they have no
+hidden channel. Prompts typed in a Claude Code or Codex terminal get it as hook
+`additionalContext`. DENY and ASK drop it, and skill slash commands do not carry it.
 
 ### Making policies discoverable
 
