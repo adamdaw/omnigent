@@ -287,3 +287,71 @@ def test_wrapper_label_session_is_native_without_resolving_harness(
 
     monkeypatch.setattr(sessions_routes, "_resolve_harness", _must_not_run)
     assert sessions_routes._is_native_terminal_session(conv) is True
+
+
+async def test_native_forward_sends_policy_context_as_a_framework_notice() -> None:
+    """
+    A web message to a native terminal carries policy context as a notice.
+
+    The executor turns the notice into hook context, so it is never typed into
+    the terminal and the message the user sent is forwarded unchanged.
+    """
+    from omnigent.server.routes._sessions.orchestration import _forward_native_terminal_message
+
+    posted: list[dict[str, object]] = []
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        import json
+
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    body = _message_event()
+    body.set_policy_context("See notes/deploy.md")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_record), base_url="http://runner"
+    ) as runner_client:
+        await _forward_native_terminal_message(
+            runner_client,
+            "e1f7c651c9f97fac088ea70ef633409d",
+            _conversation_with_wrapper("claude-code-native-ui"),
+            body,
+        )
+
+    assert posted[0]["content"] == [
+        {"type": "input_text", "text": "hello"},
+        {"type": "_omnigent_framework_notice", "text": "See notes/deploy.md"},
+    ]
+    assert body.data["content"] == [{"type": "input_text", "text": "hello"}]
+
+
+async def test_native_forward_to_codex_omits_policy_context() -> None:
+    """
+    Codex has no hidden context channel, so a web message carries no notice.
+
+    An extra block would stop ``!shell``, ``/side`` and ``/goal`` detection,
+    which needs the user's exact content, and Codex would echo it back as text.
+    """
+    from omnigent.server.routes._sessions.orchestration import _forward_native_terminal_message
+
+    posted: list[dict[str, object]] = []
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        import json
+
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    body = _message_event()
+    body.set_policy_context("See notes/deploy.md")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_record), base_url="http://runner"
+    ) as runner_client:
+        await _forward_native_terminal_message(
+            runner_client,
+            "e1f7c651c9f97fac088ea70ef633409d",
+            _conversation_with_wrapper("codex-native-ui"),
+            body,
+        )
+
+    assert posted[0]["content"] == [{"type": "input_text", "text": "hello"}]

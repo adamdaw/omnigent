@@ -777,6 +777,101 @@ async def _drain_elicitation_id(session_id: str, *, timeout_s: float = 5.0) -> s
     raise AssertionError("subscribe loop ended without an elicitation event")
 
 
+def _add_request_context(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Add context to every user prompt without changing the verdict.
+
+    :param event: Policy event dict.
+    :returns: ALLOW carrying a context string on ``request``; plain ALLOW otherwise.
+    """
+    if event["type"] == "request":
+        return {"result": "ALLOW", "context": "See notes/deploy.md"}
+    return {"result": "ALLOW"}
+
+
+async def test_request_allow_returns_policy_context(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native prompt's ALLOW carries the policy's ``context`` back to the hook.
+
+    The UserPromptSubmit hook turns this field into ``additionalContext``; if the
+    endpoint drops it, native sessions never see context a policy added.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._add_request_context")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json={"event": {"type": "PHASE_REQUEST", "data": "how do I deploy", "context": {}}},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_ALLOW"
+    assert body["context"] == "See notes/deploy.md"
+
+
+class _CaptureRunnerClient:
+    """Runner client stub that records each POSTed event body."""
+
+    def __init__(self) -> None:
+        self.bodies: list[dict[str, Any]] = []
+
+    async def post(self, path: str, *, json: dict[str, Any], **_: Any) -> Any:
+        """Record the body and answer 202 like the runner."""
+        self.bodies.append(json)
+
+        class _Accepted:
+            status_code = 202
+            headers: dict[str, str] = {}
+            text = ""
+
+        return _Accepted()
+
+
+async def test_web_message_policy_context_reaches_runner_but_is_not_stored(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Policy context rides the forwarded event as a framework notice only.
+
+    It must not become part of the stored user message, where it would be
+    replayed in history and read by title generation and the routing judge.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._add_request_context")
+    runner = _CaptureRunnerClient()
+
+    async def _runner_client(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return runner
+
+    monkeypatch.setattr(sessions_routes, "_get_runner_client", _runner_client)
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    [forwarded] = [body for body in runner.bodies if body.get("type") == "message"]
+    assert forwarded["content"] == [
+        {"type": "input_text", "text": "hi"},
+        {"type": "_omnigent_framework_notice", "text": "See notes/deploy.md"},
+    ]
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    [stored] = [item for item in items.json()["data"] if item["type"] == "message"]
+    assert stored["content"] == [{"type": "input_text", "text": "hi"}]
+    session = await client.get(f"/v1/sessions/{session_id}")
+    assert "deploy" not in (session.json().get("title") or "")
+
+
 def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> None:
     """
     Install a single function policy as the runtime default_policies.

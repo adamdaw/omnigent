@@ -11,9 +11,13 @@ the new task rather than compacting or summarising in place.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
 import re
+from collections.abc import Callable
+from pathlib import Path
 from typing import Literal
 
 from omnigent.policies.schema import (
@@ -298,6 +302,253 @@ def detect_task_switch(
     return evaluate
 
 
+# ── notes_context ────────────────────────────────────────────────────────────
+
+_NOTE_TERM = re.compile(r"[a-z0-9][a-z0-9_-]{3,}")
+_NOTE_STOPWORDS = frozenset(
+    [
+        "about",
+        "after",
+        "again",
+        "also",
+        "been",
+        "before",
+        "being",
+        "could",
+        "does",
+        "doing",
+        "from",
+        "have",
+        "here",
+        "into",
+        "just",
+        "like",
+        "make",
+        "more",
+        "most",
+        "much",
+        "need",
+        "only",
+        "other",
+        "over",
+        "please",
+        "should",
+        "some",
+        "such",
+        "than",
+        "that",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "through",
+        "very",
+        "want",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "will",
+        "with",
+        "would",
+        "your",
+    ]
+)
+_NOTE_SUMMARY_KEYS = ("question", "description", "title")
+_NOTE_SUMMARY_MAX_CHARS = 160
+# Notes scoring under this fraction of the best match are left out.
+_NOTE_RELATIVE_CUTOFF = 0.5
+
+
+def _note_query_terms(message: str) -> set[str]:
+    """
+    Return the distinct search terms in a user message.
+
+    :param message: The user's prompt text.
+    :returns: Lower-cased words of four or more characters, minus stopwords.
+    """
+    return {term for term in _NOTE_TERM.findall(message.lower()) if term not in _NOTE_STOPWORDS}
+
+
+def _note_summary(note: Path, text: str) -> str:
+    """
+    Return a one-line description of a note.
+
+    Prefers a frontmatter ``question`` / ``description`` / ``title`` field, then
+    the first ``# `` heading, then the file name.
+
+    :param note: Path to the note.
+    :param text: The note's contents.
+    :returns: A summary of at most :data:`_NOTE_SUMMARY_MAX_CHARS` characters.
+    """
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            key, _, value = line.partition(":")
+            if key.strip() in _NOTE_SUMMARY_KEYS and value.strip():
+                return value.strip()[:_NOTE_SUMMARY_MAX_CHARS]
+    for line in lines:
+        if line.startswith("# "):
+            return line[2:].strip()[:_NOTE_SUMMARY_MAX_CHARS]
+    return note.stem
+
+
+def _visible_notes(root: Path) -> list[Path]:
+    """
+    Return the ``*.md`` files under *root*, skipping hidden directories and files.
+
+    :param root: Directory to search recursively, e.g. a vault folder.
+    :returns: Sorted note paths, excluding any under ``.trash``, ``.obsidian`` etc.
+    """
+    return sorted(
+        note
+        for note in root.rglob("*.md")
+        if not any(part.startswith(".") for part in note.relative_to(root).parts)
+    )
+
+
+def _search_notes(
+    roots: list[Path],
+    terms: set[str],
+    *,
+    max_results: int,
+    min_score: float,
+    display: Callable[[Path], str] = str,
+) -> list[str]:
+    """
+    Rank markdown notes under *roots* by the rarity-weighted terms they contain.
+
+    Each matched term scores ``log(1 + notes / notes containing it)``, doubled
+    when it is in the file name, so a rare word outweighs common ones. Notes
+    below *min_score*, or below half the best note's score, are left out.
+    Unreadable files are skipped.
+
+    :param roots: Note files or directories searched recursively for ``*.md``.
+    :param terms: Search terms from :func:`_note_query_terms`.
+    :param max_results: Maximum number of notes to return.
+    :param min_score: Score a note must reach to be listed.
+    :param display: Turns a note's path into the path shown to the model.
+    :returns: ``"- <path> — <summary>"`` lines, best match first.
+    """
+    notes: list[tuple[Path, str, str, str]] = []
+    for root in roots:
+        for note in [root] if root.is_file() else _visible_notes(root):
+            try:
+                text = note.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            notes.append((note, text, note.stem.lower(), text.lower()))
+    present = {
+        term: [term in name or term in body for _, _, name, body in notes] for term in terms
+    }
+    weight = {
+        term: math.log(1 + len(notes) / hits.count(True))
+        for term, hits in present.items()
+        if any(hits)
+    }
+    scored: list[tuple[float, str, str]] = []
+    for index, (note, text, name, _) in enumerate(notes):
+        score = sum(
+            term_weight * (2 if term in name else 1)
+            for term, term_weight in weight.items()
+            if present[term][index]
+        )
+        if score >= min_score:
+            scored.append((score, display(note), _note_summary(note, text)))
+    if not scored:
+        return []
+    scored.sort(key=lambda entry: (-entry[0], entry[1]))
+    cutoff = scored[0][0] * _NOTE_RELATIVE_CUTOFF
+    return [
+        f"- {path} — {summary}" for score, path, summary in scored[:max_results] if score >= cutoff
+    ]
+
+
+def notes_context(
+    paths: list[str],
+    max_results: int = 5,
+    min_score: float = 6.0,
+    show_paths_as: dict[str, str] | None = None,
+) -> PolicyCallable:
+    """
+    Point the model at local notes that look relevant to the user's message.
+
+    Searches markdown files under *paths* for the message's words, weighting
+    rare words over common ones, and when notes score well enough ALLOWs with
+    a ``context`` list of note paths and one-line summaries. The model is told
+    the notes exist; it reads them itself. Never blocks: on no match or any
+    error it abstains.
+
+    :param paths: Note files or directories, e.g. ``["~/notes/questions"]``.
+        ``~`` is expanded; missing paths are skipped.
+    :param max_results: Maximum notes to list. Defaults to 5.
+    :param min_score: Score a note must reach to be listed. Defaults to 6.0:
+        two matched words each in fewer than 1 in 19 notes, or three each in
+        fewer than 1 in 6.
+    :param show_paths_as: Folder prefixes to rewrite in the listed paths, for
+        when the server searches a copy of notes the agent keeps elsewhere, e.g.
+        ``{"/srv/notes/vault": "~/vault"}``. The longest matching folder wins;
+        paths outside every folder are shown as they are.
+    :returns: An async policy callable that fires on ``request`` events.
+    """
+    # Agent YAML arguments skip schema checks; a bare string is one path.
+    path_list = [paths] if isinstance(paths, str) else paths
+    roots = [Path(path).expanduser() for path in path_list]
+    shown_as = sorted(
+        (
+            (Path(prefix).expanduser(), shown.rstrip("/"))
+            for prefix, shown in (show_paths_as or {}).items()
+        ),
+        key=lambda entry: len(entry[0].parts),
+        reverse=True,
+    )
+
+    def display(note: Path) -> str:
+        """Show *note* under the first (longest) mapped folder that holds it."""
+        for prefix, shown in shown_as:
+            if note.is_relative_to(prefix):
+                return f"{shown}/{note.relative_to(prefix).as_posix()}"
+        return str(note)
+
+    async def evaluate(event: PolicyEvent) -> PolicyResponse | None:
+        """
+        Search the notes for the user's message and list the matches.
+
+        :param event: Policy event dict.
+        :returns: ALLOW with ``context`` when notes match; ``None`` otherwise.
+        """
+        if event.get("type") != "request":
+            return None
+        terms = _note_query_terms(request_user_text(event.get("data")))
+        if not terms:
+            return None
+        try:
+            matches = await asyncio.to_thread(
+                _search_notes,
+                [root for root in roots if root.exists()],
+                terms,
+                max_results=max_results,
+                min_score=min_score,
+                display=display,
+            )
+        except Exception:  # noqa: BLE001 — fail-open: notes are a hint, never a gate
+            _log.exception("notes_context: note search failed")
+            return None
+        if not matches:
+            return None
+        header = "Possibly relevant notes; read them before answering from memory or searching:"
+        return {"result": "ALLOW", "context": "\n".join([header, *matches])}
+
+    return evaluate
+
+
 # ── detect_thrashing ─────────────────────────────────────────────────────────
 
 _THRASHING_HISTORY_KEY = "_thrashing_results"
@@ -482,6 +733,55 @@ def detect_thrashing(
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, object]] = [
+    {
+        "handler": "omnigent.policies.builtins.context.notes_context",
+        "kind": "factory",
+        "name": "Notes Context",
+        "description": (
+            "Searches local markdown notes for the words in each user message and "
+            "gives the model a short list of matching note paths and summaries "
+            "alongside the message, so it checks what is already written down. "
+            "Never blocks; abstains when nothing matches."
+        ),
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Note files or directories searched recursively for *.md, "
+                        "e.g. ['~/notes/questions']. Hidden folders and missing "
+                        "paths are skipped."
+                    ),
+                },
+                "max_results": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "Maximum notes to list. Defaults to 5.",
+                },
+                "min_score": {
+                    "type": "number",
+                    "default": 6.0,
+                    "description": (
+                        "Score a note must reach to be listed. Each matched word scores "
+                        "log(1 + notes / notes containing it), doubled in the file name. "
+                        "Defaults to 6.0."
+                    ),
+                },
+                "show_paths_as": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": (
+                        "Folder prefixes to rewrite in the listed paths, when the server "
+                        "searches a copy of notes the agent keeps elsewhere, e.g. "
+                        "{'/srv/notes/vault': '~/vault'}. The longest matching folder wins."
+                    ),
+                },
+            },
+            "required": ["paths"],
+        },
+    },
     {
         "handler": "omnigent.policies.builtins.context.detect_task_switch",
         "kind": "factory",

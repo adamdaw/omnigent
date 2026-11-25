@@ -424,7 +424,8 @@ def evaluation_response_to_hook_output(
     to a hard ALLOW/DENY before the response reaches the hook), so the hook
     should never see ASK; if it somehow does, it fails closed by blocking.
     ALLOW (and the engine's no-match default) returns ``None`` so the prompt
-    proceeds. Unlike ``PreToolUse``, there is no separate user-consent gate
+    proceeds, or ``hookSpecificOutput.additionalContext`` when the ALLOW
+    carries policy ``context``. Unlike ``PreToolUse``, there is no separate user-consent gate
     on a prompt, so ALLOW need not preserve one.
 
     Both Claude Code and Codex consume these exact output shapes, so the
@@ -451,6 +452,15 @@ def evaluation_response_to_hook_output(
             return {
                 "decision": "block",
                 "reason": reason or "Denied by policy",
+            }
+        # Policy context rides beside the prompt; the hook cannot rewrite it.
+        added_context = eval_response.get("context")
+        if action == "POLICY_ACTION_ALLOW" and isinstance(added_context, str) and added_context:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": hook_event,
+                    "additionalContext": added_context,
+                }
             }
         return None
 

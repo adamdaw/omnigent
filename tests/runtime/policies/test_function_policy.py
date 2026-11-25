@@ -1098,6 +1098,76 @@ async def test_engine_data_chains_sequentially_across_policies(
     assert result.data == {"query": "after-second"}
 
 
+# ── PolicyResult.context propagation ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_callable_dict_return_context_field_propagated() -> None:
+    """A dict return's ``context`` reaches PolicyResult.context unchanged."""
+    policy = FunctionPolicy(
+        _spec(),
+        lambda event: {"result": "ALLOW", "context": "See notes/deploy.md"},
+    )
+    result = await policy.evaluate(
+        EvaluationContext(phase=Phase.REQUEST, content="how do I deploy"),
+        {"labels": {}, "conversation_id": "c"},
+    )
+    assert result.context == "See notes/deploy.md"
+    assert result.data is None
+
+
+@pytest.mark.asyncio
+async def test_engine_joins_context_from_allowing_policies_in_order(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Context is additive: each ALLOW's context is kept, in declaration order.
+
+    Unlike ``data``, context never replaces the message or an earlier
+    policy's context, and later policies still see the original content.
+    """
+    seen_by_second: list[object] = []
+
+    def second(event: dict) -> PolicyResult:
+        seen_by_second.append(event["data"])
+        return PolicyResult(action=PolicyAction.ALLOW, context="from second")
+
+    policies = [
+        FunctionPolicy(
+            _spec(name="first"),
+            lambda _event: PolicyResult(action=PolicyAction.ALLOW, context="from first"),
+        ),
+        FunctionPolicy(_spec(name="silent"), lambda _event: {"result": "ALLOW"}),
+        FunctionPolicy(_spec(name="second"), second),
+    ]
+    engine = _build_engine(conversation_store, policies)
+    result = await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="original"))
+    assert result.action == PolicyAction.ALLOW
+    assert result.context == "from first\n\nfrom second"
+    assert result.data is None
+    assert seen_by_second == ["original"]
+
+
+@pytest.mark.asyncio
+async def test_engine_deny_drops_context(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A DENY carries no context: the message never reaches the model."""
+    policies = [
+        FunctionPolicy(
+            _spec(name="adds"),
+            lambda _event: PolicyResult(action=PolicyAction.ALLOW, context="notes"),
+        ),
+        FunctionPolicy(
+            _spec(name="blocks"),
+            lambda _event: PolicyResult(action=PolicyAction.DENY, reason="no"),
+        ),
+    ]
+    engine = _build_engine(conversation_store, policies)
+    result = await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hi"))
+    assert result.action == PolicyAction.DENY
+    assert result.context is None
+
+
 @pytest.mark.parametrize(
     "tool_name,expected",
     [

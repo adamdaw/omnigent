@@ -405,6 +405,34 @@ def test_user_prompt_submit_non_blocking_actions_return_none(action: str) -> Non
     assert output is None
 
 
+def test_user_prompt_submit_allow_with_context_adds_context() -> None:
+    """
+    An ALLOW carrying policy context becomes ``additionalContext``.
+
+    The prompt still proceeds (no ``decision``); the context reaches the model
+    beside the prompt rather than rewriting it.
+    """
+    output = evaluation_response_to_hook_output(
+        "UserPromptSubmit",
+        {"result": "POLICY_ACTION_ALLOW", "context": "See notes/deploy.md"},
+    )
+    assert output == {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": "See notes/deploy.md",
+        }
+    }
+
+
+def test_user_prompt_submit_deny_ignores_context() -> None:
+    """A DENY still blocks, and any context is dropped with the prompt."""
+    output = evaluation_response_to_hook_output(
+        "UserPromptSubmit",
+        {"result": "POLICY_ACTION_DENY", "reason": "no", "context": "notes"},
+    )
+    assert output == {"decision": "block", "reason": "no"}
+
+
 def test_fail_closed_pre_tool_use_denies() -> None:
     """
     An unobtainable verdict on PreToolUse fails CLOSED with ``deny``.

@@ -360,6 +360,8 @@ class PolicyEngine:
         # in the chain transforms the already-transformed payload rather
         # than the original. The final value is the fully-composed result.
         composed_data: Any = None
+        # Additive context from ALLOWing policies; never fed back as content.
+        added_context: list[str] = []
         context = self._context()
 
         ctx = self._inject_session_state(ctx)
@@ -398,6 +400,8 @@ class PolicyEngine:
                 # Feed the transformed payload forward so the next policy
                 # in the chain sees this policy's output, not the original.
                 ctx = replace(ctx, content=composed_data)
+            if result.context and result.action == PolicyAction.ALLOW:
+                added_context.append(result.context)
             if result.action == PolicyAction.ASK:
                 ask_reasons.append(
                     f"{policy.spec.name}: {result.reason or 'approval required'}",
@@ -430,6 +434,7 @@ class PolicyEngine:
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
             data=composed_data,
+            context="\n\n".join(added_context) if added_context else None,
         )
 
     def _compose_deny(

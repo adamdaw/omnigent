@@ -577,6 +577,7 @@ def _policy_result_from_dict(
             "data": ...,
             "state_updates": [...],
             "set_labels": {...},
+            "context": "...",
         }
 
     :param raw: The callable's dict return.
@@ -607,9 +608,11 @@ def _policy_result_from_dict(
     raw_state_updates = raw.get("state_updates")
     raw_set_labels = raw.get("set_labels")
     reason = raw.get("reason")
+    context = raw.get("context")
     return PolicyResult(
         action=action,
         reason=cast("str | None", reason),
+        context=context if isinstance(context, str) and context else None,
         data=raw.get("data"),
         state_updates=_coerce_state_updates(raw_state_updates, spec_name=spec_name),
         set_labels=dict(raw_set_labels) if isinstance(raw_set_labels, dict) else None,

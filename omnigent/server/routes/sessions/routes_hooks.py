@@ -1197,6 +1197,8 @@ def register_hooks_routes(
             resp_body["reason"] = result.reason
         if result.data is not None:
             resp_body["data"] = result.data
+        if result.context:
+            resp_body["context"] = result.context
         # Tag the audit envelope with the decision so a DENY/ASK is debuggable
         # (a deny returns HTTP 200, so status alone can't tell you the verdict).
         add_audit_attrs(
