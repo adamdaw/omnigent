@@ -102,6 +102,25 @@ def test_framework_notice_is_system_context_not_user_text() -> None:
     ]
 
 
+def test_text_framework_notice_is_system_context_not_user_text() -> None:
+    """A text notice (e.g. policy context) becomes its own system message."""
+    from omnigent.inner.native_attachments import expand_framework_notices, text_notice_block
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "how do I deploy"},
+                text_notice_block("See notes/deploy.md"),
+            ],
+        }
+    ]
+    assert expand_framework_notices(messages) == [
+        {"role": "system", "content": [{"type": "input_text", "text": "See notes/deploy.md"}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "how do I deploy"}]},
+    ]
+
+
 def test_authored_notice_cannot_be_loaded_as_message_data() -> None:
     from pydantic import ValidationError
 

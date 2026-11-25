@@ -625,9 +625,12 @@ def block_domains(blocked_domains: list[str]) -> callable:
 
 On `request` events an `ALLOW` may carry `"context": "<text>"` to give the model
 extra text beside the user's message, unlike `data`, which replaces it. Context
-from several policies is joined in order. Web and API messages get it as a
-separate `[Context added by policy]` block; native Claude Code and Codex prompts
-typed in the terminal get it as hook `additionalContext`. DENY and ASK drop it.
+from several policies is joined in order. It is model-only and never stored with
+the message, so it stays out of history, titles and routing. Web and API messages
+forward it to the runner as a framework notice: SDK agents get a system message,
+Claude Code gets hook context, and Codex gets a trailing text input. Prompts typed
+in a Claude Code or Codex terminal get it as hook `additionalContext`. DENY and ASK
+drop it, and skill slash commands do not carry it.
 
 ### Making policies discoverable
 

@@ -75,6 +75,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.inner.native_attachments import text_notice_block
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.models.model_metadata import concrete_reported_model
@@ -7467,6 +7468,22 @@ async def _forward_native_subagent_terminal_failure(
     _require_external_status_forward(session_id, "failed", runner_result)
 
 
+def _append_policy_context_notice(event: dict[str, Any], body: SessionEventInput) -> None:
+    """
+    Add request-policy context to a runner-bound event as a framework notice.
+
+    The notice reaches the model as hidden context (system text, or native hook
+    context) and is never persisted, so titles, routing and history never see it.
+
+    :param event: The runner event or forwarded data; its ``content`` list is
+        replaced, never mutated, so the stored message keeps its own copy.
+    :param body: The validated user message, carrying any policy context.
+    """
+    content = event.get("content")
+    if body.policy_context and isinstance(content, list):
+        event["content"] = [*content, text_notice_block(body.policy_context)]
+
+
 def _build_native_terminal_message_event(
     conv: Conversation,
     body: SessionEventInput,
@@ -7629,6 +7646,7 @@ async def _forward_native_terminal_message(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+    _append_policy_context_notice(event, body)
     forward_options: dict[str, Any] = {}
     if native_shell_authorized:
         from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER
@@ -8292,6 +8310,8 @@ async def _forward_event_to_runner(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
+
+    _append_policy_context_notice(forwarded_data, body)
 
     from omnigent.tools.browser_agent_tools import browser_agent_tools_turn_flag
 
@@ -11637,8 +11657,8 @@ async def _evaluate_input_policy(
         ``{"run_as": "alice@example.com"}``. ``None`` when
         identity is unknown.
     :returns: ``None`` on ALLOW or an approved ASK (fall through to the
-        forward path). On an ALLOW carrying policy ``context``, a marked
-        ``input_text`` block is first appended to ``body``'s content.
+        forward path). An ALLOW's policy ``context`` is recorded on
+        ``body`` for the forward step; it is never stored with the message.
         A verdict dict ``{"verdict": "deny", "reason":
         ...}`` on DENY or a declined / timed-out ASK.
     """
@@ -11707,11 +11727,8 @@ async def _evaluate_input_policy(
     if result.action == PolicyAction.ALLOW:
         if result.set_labels:
             await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
-        if result.context and isinstance(raw_content_blocks, list):
-            # A separate, marked block so the transcript shows it was not typed.
-            raw_content_blocks.append(
-                {"type": "input_text", "text": f"[Context added by policy]\n{result.context}"}
-            )
+        if result.context:
+            body.set_policy_context(result.context)
         return None
 
     if result.action == PolicyAction.DENY:

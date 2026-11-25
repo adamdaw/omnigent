@@ -399,6 +399,20 @@ def _note_summary(note: Path, text: str) -> str:
     return note.stem
 
 
+def _visible_notes(root: Path) -> list[Path]:
+    """
+    Return the ``*.md`` files under *root*, skipping hidden directories and files.
+
+    :param root: Directory to search recursively, e.g. a vault folder.
+    :returns: Sorted note paths, excluding any under ``.trash``, ``.obsidian`` etc.
+    """
+    return sorted(
+        note
+        for note in root.rglob("*.md")
+        if not any(part.startswith(".") for part in note.relative_to(root).parts)
+    )
+
+
 def _search_notes(
     roots: list[Path],
     terms: set[str],
@@ -422,7 +436,7 @@ def _search_notes(
     """
     notes: list[tuple[Path, str, str, str]] = []
     for root in roots:
-        for note in [root] if root.is_file() else sorted(root.rglob("*.md")):
+        for note in [root] if root.is_file() else _visible_notes(root):
             try:
                 text = note.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -471,11 +485,14 @@ def notes_context(
     :param paths: Note files or directories, e.g. ``["~/notes/questions"]``.
         ``~`` is expanded; missing paths are skipped.
     :param max_results: Maximum notes to list. Defaults to 5.
-    :param min_score: Score a note must reach to be listed. Defaults to 6.0,
-        roughly two words that each appear in under a tenth of the notes.
+    :param min_score: Score a note must reach to be listed. Defaults to 6.0:
+        two matched words each in fewer than 1 in 19 notes, or three each in
+        fewer than 1 in 6.
     :returns: An async policy callable that fires on ``request`` events.
     """
-    roots = [Path(path).expanduser() for path in paths]
+    # Agent YAML arguments skip schema checks; a bare string is one path.
+    path_list = [paths] if isinstance(paths, str) else paths
+    roots = [Path(path).expanduser() for path in path_list]
 
     async def evaluate(event: PolicyEvent) -> PolicyResponse | None:
         """
@@ -710,7 +727,8 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "items": {"type": "string"},
                     "description": (
                         "Note files or directories searched recursively for *.md, "
-                        "e.g. ['~/notes/questions']. Missing paths are skipped."
+                        "e.g. ['~/notes/questions']. Hidden folders and missing "
+                        "paths are skipped."
                     ),
                 },
                 "max_results": {

@@ -814,6 +814,37 @@ async def test_resize_notice_uses_hidden_hook_context(
 
 
 @pytest.mark.asyncio
+async def test_text_notice_uses_hidden_hook_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Policy context reaches Claude as hook context, never as typed prompt text."""
+    from omnigent.inner.native_attachments import text_notice_block
+
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    async for _ in executor.run_turn(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "how do I deploy"},
+                    text_notice_block("See notes/deploy.md"),
+                ],
+            },
+        ],
+        [],
+        "",
+    ):
+        pass
+
+    assert sent[0]["content"] == "how do I deploy"
+    assert (tmp_path / "pending_framework_context.txt").read_text() == "See notes/deploy.md"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error", [RuntimeError("injection failed"), ClaudePromptTimeout("timeout")]
 )

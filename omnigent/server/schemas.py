@@ -18,6 +18,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     RootModel,
     SerializerFunctionWrapHandler,
     Strict,
@@ -1490,6 +1491,18 @@ class SessionEventInput(BaseModel):
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None
     workflow_run_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    # Model-only text from request policies. Set by the input gate, never by
+    # the client, and forwarded as a framework notice instead of being stored.
+    _policy_context: str | None = PrivateAttr(default=None)
+
+    @property
+    def policy_context(self) -> str | None:
+        """Context request policies added to this message, or ``None``."""
+        return self._policy_context
+
+    def set_policy_context(self, text: str | None) -> None:
+        """Record request-policy context to forward with this message."""
+        self._policy_context = text
 
     @field_validator("data")
     @classmethod

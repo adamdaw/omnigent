@@ -637,3 +637,26 @@ async def test_notes_context_skips_missing_and_unreadable_paths(tmp_path: Path) 
     result = await policy(_event("restic restore of the archive"))
     assert result is not None
     assert "backup-restore.md" in result["context"]
+
+
+async def test_notes_context_accepts_a_single_path_string(tmp_path: Path) -> None:
+    """A bare string is one path, not a sequence of one-letter paths to scan."""
+    from omnigent.policies.builtins.context import notes_context
+
+    _write_notes(tmp_path)
+    policy = notes_context(paths=str(tmp_path), min_score=1.0)  # type: ignore[arg-type]
+    result = await policy(_event("restic restore of the archive"))
+    assert result is not None
+    assert result["context"].splitlines()[1:] == [
+        f"- {tmp_path / 'questions' / 'backup-restore.md'}"
+        " — How long does a restic restore of the archive take?"
+    ]
+
+
+async def test_notes_context_skips_hidden_directories(tmp_path: Path) -> None:
+    from omnigent.policies.builtins.context import notes_context
+
+    (tmp_path / ".trash").mkdir()
+    (tmp_path / ".trash" / "restic-restore.md").write_text("# Old\nrestic restore archive\n")
+    policy = notes_context(paths=[str(tmp_path)], min_score=0.1)
+    assert await policy(_event("restic restore of the archive")) is None

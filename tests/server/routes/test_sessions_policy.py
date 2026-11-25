@@ -547,16 +547,19 @@ async def test_input_allow_verdict():
 
 
 @pytest.mark.asyncio
-async def test_input_allow_with_context_appends_marked_block():
-    """An ALLOW carrying policy context forwards the message plus a marked block.
+async def test_input_allow_with_context_is_kept_off_the_stored_message():
+    """An ALLOW's policy context is recorded for the forward, not added to content.
 
-    The typed text is left untouched; the context is a separate ``input_text``
-    block so the transcript shows it was added, not typed.
+    Content is what gets persisted, titled and routed, so it must stay exactly
+    what the user typed.
     """
     conv_store = _FakeConversationStore()
     agent_store = _FakeAgentStore(agent=_make_agent())
     conv = conv_store.get_conversation("sess_1")
-    body = _make_user_message_body("how do I deploy")
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "how do I deploy"}]},
+    )
 
     loaded = LoadedAgent(spec=_make_spec_with_guardrails(), workdir="/tmp/fake")
 
@@ -583,10 +586,36 @@ async def test_input_allow_with_context_appends_marked_block():
         )
 
     assert result is None
-    assert body.data["content"] == [
-        {"type": "input_text", "text": "how do I deploy"},
-        {"type": "input_text", "text": "[Context added by policy]\nSee notes/deploy.md"},
+    assert body.data["content"] == [{"type": "input_text", "text": "how do I deploy"}]
+    assert body.policy_context == "See notes/deploy.md"
+
+
+def test_policy_context_notice_is_added_to_a_copy_of_the_content():
+    """The forward helper replaces the event's list, leaving the body's own list intact."""
+    from omnigent.server.routes._sessions.orchestration import _append_policy_context_notice
+
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    )
+    body.set_policy_context("See notes/deploy.md")
+    event = {"content": body.data["content"]}
+
+    _append_policy_context_notice(event, body)
+
+    assert event["content"] == [
+        {"type": "input_text", "text": "hi"},
+        {"type": "_omnigent_framework_notice", "text": "See notes/deploy.md"},
     ]
+    assert body.data["content"] == [{"type": "input_text", "text": "hi"}]
+
+
+def test_policy_context_cannot_be_set_by_the_client():
+    """A client-supplied ``policy_context`` field is not model context."""
+    body = SessionEventInput.model_validate(
+        {"type": "message", "data": {"role": "user", "content": []}, "policy_context": "x"}
+    )
+    assert body.policy_context is None
 
 
 @pytest.mark.asyncio
