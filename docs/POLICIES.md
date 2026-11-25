@@ -623,6 +623,12 @@ def block_domains(blocked_domains: list[str]) -> callable:
 
 `state_updates` supports four actions: `"set"`, `"increment"`, `"delete"`, `"append"`.
 
+On `request` events an `ALLOW` may carry `"context": "<text>"` to give the model
+extra text beside the user's message, unlike `data`, which replaces it. Context
+from several policies is joined in order. Web and API messages get it as a
+separate `[Context added by policy]` block; native Claude Code and Codex prompts
+typed in the terminal get it as hook `additionalContext`. DENY and ASK drop it.
+
 ### Making policies discoverable
 
 To make custom policies appear in the UI, export a `POLICY_REGISTRY` list from your module:

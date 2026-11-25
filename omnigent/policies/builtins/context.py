@@ -11,9 +11,11 @@ the new task rather than compacting or summarising in place.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Literal
 
 from omnigent.policies.schema import (
@@ -298,6 +300,191 @@ def detect_task_switch(
     return evaluate
 
 
+# ── notes_context ────────────────────────────────────────────────────────────
+
+_NOTE_TERM = re.compile(r"[a-z0-9][a-z0-9_-]{3,}")
+_NOTE_STOPWORDS = frozenset(
+    [
+        "about",
+        "after",
+        "again",
+        "also",
+        "been",
+        "before",
+        "being",
+        "could",
+        "does",
+        "doing",
+        "from",
+        "have",
+        "here",
+        "into",
+        "just",
+        "like",
+        "make",
+        "more",
+        "most",
+        "much",
+        "need",
+        "only",
+        "other",
+        "over",
+        "please",
+        "should",
+        "some",
+        "such",
+        "than",
+        "that",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "through",
+        "very",
+        "want",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "will",
+        "with",
+        "would",
+        "your",
+    ]
+)
+_NOTE_SUMMARY_KEYS = ("question", "description", "title")
+_NOTE_SUMMARY_MAX_CHARS = 160
+
+
+def _note_query_terms(message: str) -> set[str]:
+    """
+    Return the distinct search terms in a user message.
+
+    :param message: The user's prompt text.
+    :returns: Lower-cased words of four or more characters, minus stopwords.
+    """
+    return {term for term in _NOTE_TERM.findall(message.lower()) if term not in _NOTE_STOPWORDS}
+
+
+def _note_summary(note: Path, text: str) -> str:
+    """
+    Return a one-line description of a note.
+
+    Prefers a frontmatter ``question`` / ``description`` / ``title`` field, then
+    the first ``# `` heading, then the file name.
+
+    :param note: Path to the note.
+    :param text: The note's contents.
+    :returns: A summary of at most :data:`_NOTE_SUMMARY_MAX_CHARS` characters.
+    """
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            key, _, value = line.partition(":")
+            if key.strip() in _NOTE_SUMMARY_KEYS and value.strip():
+                return value.strip()[:_NOTE_SUMMARY_MAX_CHARS]
+    for line in lines:
+        if line.startswith("# "):
+            return line[2:].strip()[:_NOTE_SUMMARY_MAX_CHARS]
+    return note.stem
+
+
+def _search_notes(
+    roots: list[Path],
+    terms: set[str],
+    *,
+    max_results: int,
+    min_matches: int,
+) -> list[str]:
+    """
+    Rank markdown notes under *roots* by how many query terms they contain.
+
+    A term found in the file name counts twice. Unreadable files are skipped.
+
+    :param roots: Note files or directories searched recursively for ``*.md``.
+    :param terms: Search terms from :func:`_note_query_terms`.
+    :param max_results: Maximum number of notes to return.
+    :param min_matches: Distinct terms a note must contain to be listed.
+    :returns: ``"- <path> — <summary>"`` lines, best match first.
+    """
+    scored: list[tuple[int, str, str]] = []
+    for root in roots:
+        notes = [root] if root.is_file() else sorted(root.rglob("*.md"))
+        for note in notes:
+            try:
+                text = note.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            name, body = note.stem.lower(), text.lower()
+            matched = [term for term in terms if term in body or term in name]
+            if len(matched) < min_matches:
+                continue
+            score = len(matched) + sum(1 for term in matched if term in name)
+            scored.append((score, str(note), _note_summary(note, text)))
+    scored.sort(key=lambda entry: (-entry[0], entry[1]))
+    return [f"- {path} — {summary}" for _, path, summary in scored[:max_results]]
+
+
+def notes_context(
+    paths: list[str],
+    max_results: int = 5,
+    min_matches: int = 2,
+) -> PolicyCallable:
+    """
+    Point the model at local notes that look relevant to the user's message.
+
+    Searches markdown files under *paths* for the message's words and, when
+    any note matches enough of them, ALLOWs with a ``context`` list of note
+    paths and one-line summaries. The model is told the notes exist; it
+    reads them itself. Never blocks: on no match or any error it abstains.
+
+    :param paths: Note files or directories, e.g. ``["~/notes/questions"]``.
+        ``~`` is expanded; missing paths are skipped.
+    :param max_results: Maximum notes to list. Defaults to 5.
+    :param min_matches: Distinct message words a note must contain.
+        Defaults to 2.
+    :returns: An async policy callable that fires on ``request`` events.
+    """
+    roots = [Path(path).expanduser() for path in paths]
+
+    async def evaluate(event: PolicyEvent) -> PolicyResponse | None:
+        """
+        Search the notes for the user's message and list the matches.
+
+        :param event: Policy event dict.
+        :returns: ALLOW with ``context`` when notes match; ``None`` otherwise.
+        """
+        if event.get("type") != "request":
+            return None
+        terms = _note_query_terms(request_user_text(event.get("data")))
+        if len(terms) < min_matches:
+            return None
+        try:
+            matches = await asyncio.to_thread(
+                _search_notes,
+                [root for root in roots if root.exists()],
+                terms,
+                max_results=max_results,
+                min_matches=min_matches,
+            )
+        except Exception:  # noqa: BLE001 — fail-open: notes are a hint, never a gate
+            _log.exception("notes_context: note search failed")
+            return None
+        if not matches:
+            return None
+        header = "Possibly relevant notes; read them before answering from memory or searching:"
+        return {"result": "ALLOW", "context": "\n".join([header, *matches])}
+
+    return evaluate
+
+
 # ── detect_thrashing ─────────────────────────────────────────────────────────
 
 _THRASHING_HISTORY_KEY = "_thrashing_results"
@@ -482,6 +669,43 @@ def detect_thrashing(
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, object]] = [
+    {
+        "handler": "omnigent.policies.builtins.context.notes_context",
+        "kind": "factory",
+        "name": "Notes Context",
+        "description": (
+            "Searches local markdown notes for the words in each user message and "
+            "gives the model a short list of matching note paths and summaries "
+            "alongside the message, so it checks what is already written down. "
+            "Never blocks; abstains when nothing matches."
+        ),
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Note files or directories searched recursively for *.md, "
+                        "e.g. ['~/notes/questions']. Missing paths are skipped."
+                    ),
+                },
+                "max_results": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "Maximum notes to list. Defaults to 5.",
+                },
+                "min_matches": {
+                    "type": "integer",
+                    "default": 2,
+                    "description": (
+                        "Distinct message words a note must contain to be listed. Defaults to 2."
+                    ),
+                },
+            },
+            "required": ["paths"],
+        },
+    },
     {
         "handler": "omnigent.policies.builtins.context.detect_task_switch",
         "kind": "factory",

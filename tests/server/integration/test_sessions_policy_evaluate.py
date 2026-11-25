@@ -777,6 +777,42 @@ async def _drain_elicitation_id(session_id: str, *, timeout_s: float = 5.0) -> s
     raise AssertionError("subscribe loop ended without an elicitation event")
 
 
+def _add_request_context(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Add context to every user prompt without changing the verdict.
+
+    :param event: Policy event dict.
+    :returns: ALLOW carrying a context string on ``request``; plain ALLOW otherwise.
+    """
+    if event["type"] == "request":
+        return {"result": "ALLOW", "context": "See notes/deploy.md"}
+    return {"result": "ALLOW"}
+
+
+async def test_request_allow_returns_policy_context(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native prompt's ALLOW carries the policy's ``context`` back to the hook.
+
+    The UserPromptSubmit hook turns this field into ``additionalContext``; if the
+    endpoint drops it, native sessions never see context a policy added.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._add_request_context")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json={"event": {"type": "PHASE_REQUEST", "data": "how do I deploy", "context": {}}},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_ALLOW"
+    assert body["context"] == "See notes/deploy.md"
+
+
 def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> None:
     """
     Install a single function policy as the runtime default_policies.

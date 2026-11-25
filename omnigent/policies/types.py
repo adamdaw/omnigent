@@ -296,6 +296,11 @@ class PolicyResult:
         agent-spec policies (not workspace-scoped) and on ALLOW.
         Surfaced so a denial can be attributed to the owning
         workspace in logs.
+    :param context: Optional text to give the model alongside the
+        user's message on REQUEST, e.g. notes relevant to the prompt.
+        Additive, unlike ``data``: it never replaces the message, and the
+        engine joins every ALLOWing policy's context in declaration order.
+        ``None`` on DENY and ASK, or when no policy added any.
     """
 
     action: PolicyAction
@@ -305,6 +310,7 @@ class PolicyResult:
     data: object | None = None
     state_updates: list[StateUpdate] | None = None
     deciding_policy_workspace_id: int | None = None
+    context: str | None = None
 
     @property
     def deciding_policy(self) -> str | None:

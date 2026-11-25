@@ -547,6 +547,49 @@ async def test_input_allow_verdict():
 
 
 @pytest.mark.asyncio
+async def test_input_allow_with_context_appends_marked_block():
+    """An ALLOW carrying policy context forwards the message plus a marked block.
+
+    The typed text is left untouched; the context is a separate ``input_text``
+    block so the transcript shows it was added, not typed.
+    """
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+    body = _make_user_message_body("how do I deploy")
+
+    loaded = LoadedAgent(spec=_make_spec_with_guardrails(), workdir="/tmp/fake")
+
+    async def _eval(_ctx: Any) -> PolicyResult:
+        return PolicyResult(action=PolicyAction.ALLOW, context="See notes/deploy.md")
+
+    with (
+        patch(_CACHE_PATCH) as mock_cache,
+        patch(_ENGINE_PATCH) as mock_build,
+    ):
+        mock_cache.return_value.load.return_value = loaded
+        mock_engine = mock_build.return_value
+        mock_engine.evaluate = _eval
+        mock_engine.apply_label_writes = lambda x: None
+
+        result = await _evaluate_input_policy(
+            _FakeRequest(),
+            "sess_1",
+            conv,
+            body,
+            conv_store,
+            agent_store,
+            None,
+        )
+
+    assert result is None
+    assert body.data["content"] == [
+        {"type": "input_text", "text": "how do I deploy"},
+        {"type": "input_text", "text": "[Context added by policy]\nSee notes/deploy.md"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_input_deny_verdict():
     """INPUT policy evaluation returns deny when the engine DENYs."""
     conv_store = _FakeConversationStore()

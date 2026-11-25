@@ -362,6 +362,9 @@ class PolicyResponse(TypedDict, total=False):
         ``DENY``; withheld on ``ASK`` pending approval.
     :param set_labels: Label key-value writes. Filtered through
         the policy's ``set_labels`` whitelist (if declared).
+    :param context: Text given to the model alongside the user's
+        message on ``request`` events (ALLOW only). Added, never
+        substituted; see :attr:`PolicyResult.context`.
     """
 
     result: Literal["ALLOW", "DENY", "ASK"]
@@ -369,6 +372,7 @@ class PolicyResponse(TypedDict, total=False):
     data: object
     state_updates: list[StateUpdateEntry]
     set_labels: dict[str, str]
+    context: str
 
 
 # ── Callable protocol ────────────────────────────────────────────────────────

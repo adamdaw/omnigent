@@ -11637,7 +11637,9 @@ async def _evaluate_input_policy(
         ``{"run_as": "alice@example.com"}``. ``None`` when
         identity is unknown.
     :returns: ``None`` on ALLOW or an approved ASK (fall through to the
-        forward path). A verdict dict ``{"verdict": "deny", "reason":
+        forward path). On an ALLOW carrying policy ``context``, a marked
+        ``input_text`` block is first appended to ``body``'s content.
+        A verdict dict ``{"verdict": "deny", "reason":
         ...}`` on DENY or a declined / timed-out ASK.
     """
 
@@ -11705,6 +11707,11 @@ async def _evaluate_input_policy(
     if result.action == PolicyAction.ALLOW:
         if result.set_labels:
             await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
+        if result.context and isinstance(raw_content_blocks, list):
+            # A separate, marked block so the transcript shows it was not typed.
+            raw_content_blocks.append(
+                {"type": "input_text", "text": f"[Context added by policy]\n{result.context}"}
+            )
         return None
 
     if result.action == PolicyAction.DENY:

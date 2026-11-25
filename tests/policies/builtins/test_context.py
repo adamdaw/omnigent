@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from omnigent.policies.builtins.context import (
@@ -523,3 +525,90 @@ class TestDetectThrashingRobustness:
         policy = detect_thrashing(consecutive_threshold=0, window=0, window_error_rate=0.5)
         result = policy(_result_event("Error: x", history=[1, 1]))
         assert result is not None
+
+
+# ── notes_context ────────────────────────────────────────────────────────────
+
+
+def _write_notes(root: Path) -> None:
+    (root / "questions").mkdir()
+    (root / "questions" / "backup-restore.md").write_text(
+        "---\nquestion: How long does a restic restore of the archive take?\n---\n"
+        "# Restore timing\nRestic restore from the mirror disks took four hours.\n"
+    )
+    (root / "questions" / "photo-library.md").write_text(
+        "# Photo library\nThe photo library is indexed read-only.\n"
+    )
+    (root / "inventory.md").write_text("# Inventory\nMachines and backup schedules.\n")
+    (root / "questions" / "notes.txt").write_text("restic restore archive timing")
+
+
+async def test_notes_context_lists_matching_notes_best_first(tmp_path: Path) -> None:
+    from omnigent.policies.builtins.context import notes_context
+
+    _write_notes(tmp_path)
+    policy = notes_context(paths=[str(tmp_path)])
+    result = await policy(_event("how long would a restic restore of the archive take?"))
+    assert result is not None
+    assert result["result"] == "ALLOW"
+    lines = result["context"].splitlines()
+    assert lines[0].startswith("Possibly relevant notes")
+    assert lines[1] == (
+        f"- {tmp_path / 'questions' / 'backup-restore.md'}"
+        " — How long does a restic restore of the archive take?"
+    )
+    # Only markdown notes are searched, and weak matches are left out.
+    assert len(lines) == 2
+
+
+async def test_notes_context_summary_falls_back_to_heading(tmp_path: Path) -> None:
+    from omnigent.policies.builtins.context import notes_context
+
+    _write_notes(tmp_path)
+    policy = notes_context(paths=[str(tmp_path / "questions")], min_matches=2)
+    result = await policy(_event("is the photo library indexed?"))
+    assert result is not None
+    assert result["context"].splitlines()[1].endswith("— Photo library")
+
+
+async def test_notes_context_caps_results(tmp_path: Path) -> None:
+    from omnigent.policies.builtins.context import notes_context
+
+    for index in range(4):
+        (tmp_path / f"deploy-{index}.md").write_text("# Deploy\nDeploy the server with care.\n")
+    policy = notes_context(paths=[str(tmp_path)], max_results=2)
+    result = await policy(_event("how do I deploy the server"))
+    assert result is not None
+    assert len(result["context"].splitlines()) == 3
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["", "the and of it", "something entirely unrelated to anything filed"],
+    ids=["empty", "only-stopwords", "no-match"],
+)
+async def test_notes_context_abstains_without_matches(tmp_path: Path, message: str) -> None:
+    from omnigent.policies.builtins.context import notes_context
+
+    _write_notes(tmp_path)
+    policy = notes_context(paths=[str(tmp_path)])
+    assert await policy(_event(message)) is None
+
+
+async def test_notes_context_ignores_other_phases(tmp_path: Path) -> None:
+    from omnigent.policies.builtins.context import notes_context
+
+    _write_notes(tmp_path)
+    policy = notes_context(paths=[str(tmp_path)])
+    assert await policy(_event("restic restore archive", phase="tool_call")) is None
+
+
+async def test_notes_context_skips_missing_and_unreadable_paths(tmp_path: Path) -> None:
+    from omnigent.policies.builtins.context import notes_context
+
+    _write_notes(tmp_path)
+    (tmp_path / "broken.md").symlink_to(tmp_path / "does-not-exist.md")
+    policy = notes_context(paths=[str(tmp_path / "missing"), str(tmp_path)])
+    result = await policy(_event("restic restore of the archive"))
+    assert result is not None
+    assert "backup-restore.md" in result["context"]
