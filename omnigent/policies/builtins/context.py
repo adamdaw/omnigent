@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
@@ -419,6 +420,7 @@ def _search_notes(
     *,
     max_results: int,
     min_score: float,
+    display: Callable[[Path], str] = str,
 ) -> list[str]:
     """
     Rank markdown notes under *roots* by the rarity-weighted terms they contain.
@@ -432,6 +434,7 @@ def _search_notes(
     :param terms: Search terms from :func:`_note_query_terms`.
     :param max_results: Maximum number of notes to return.
     :param min_score: Score a note must reach to be listed.
+    :param display: Turns a note's path into the path shown to the model.
     :returns: ``"- <path> — <summary>"`` lines, best match first.
     """
     notes: list[tuple[Path, str, str, str]] = []
@@ -458,7 +461,7 @@ def _search_notes(
             if present[term][index]
         )
         if score >= min_score:
-            scored.append((score, str(note), _note_summary(note, text)))
+            scored.append((score, display(note), _note_summary(note, text)))
     if not scored:
         return []
     scored.sort(key=lambda entry: (-entry[0], entry[1]))
@@ -472,6 +475,7 @@ def notes_context(
     paths: list[str],
     max_results: int = 5,
     min_score: float = 6.0,
+    show_paths_as: dict[str, str] | None = None,
 ) -> PolicyCallable:
     """
     Point the model at local notes that look relevant to the user's message.
@@ -488,11 +492,30 @@ def notes_context(
     :param min_score: Score a note must reach to be listed. Defaults to 6.0:
         two matched words each in fewer than 1 in 19 notes, or three each in
         fewer than 1 in 6.
+    :param show_paths_as: Folder prefixes to rewrite in the listed paths, for
+        when the server searches a copy of notes the agent keeps elsewhere, e.g.
+        ``{"/srv/notes/vault": "~/vault"}``. The longest matching folder wins;
+        paths outside every folder are shown as they are.
     :returns: An async policy callable that fires on ``request`` events.
     """
     # Agent YAML arguments skip schema checks; a bare string is one path.
     path_list = [paths] if isinstance(paths, str) else paths
     roots = [Path(path).expanduser() for path in path_list]
+    shown_as = sorted(
+        (
+            (Path(prefix).expanduser(), shown.rstrip("/"))
+            for prefix, shown in (show_paths_as or {}).items()
+        ),
+        key=lambda entry: len(entry[0].parts),
+        reverse=True,
+    )
+
+    def display(note: Path) -> str:
+        """Show *note* under the first (longest) mapped folder that holds it."""
+        for prefix, shown in shown_as:
+            if note.is_relative_to(prefix):
+                return f"{shown}/{note.relative_to(prefix).as_posix()}"
+        return str(note)
 
     async def evaluate(event: PolicyEvent) -> PolicyResponse | None:
         """
@@ -513,6 +536,7 @@ def notes_context(
                 terms,
                 max_results=max_results,
                 min_score=min_score,
+                display=display,
             )
         except Exception:  # noqa: BLE001 — fail-open: notes are a hint, never a gate
             _log.exception("notes_context: note search failed")
@@ -743,6 +767,15 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                         "Score a note must reach to be listed. Each matched word scores "
                         "log(1 + notes / notes containing it), doubled in the file name. "
                         "Defaults to 6.0."
+                    ),
+                },
+                "show_paths_as": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": (
+                        "Folder prefixes to rewrite in the listed paths, when the server "
+                        "searches a copy of notes the agent keeps elsewhere, e.g. "
+                        "{'/srv/notes/vault': '~/vault'}. The longest matching folder wins."
                     ),
                 },
             },

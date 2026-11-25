@@ -660,3 +660,36 @@ async def test_notes_context_skips_hidden_directories(tmp_path: Path) -> None:
     (tmp_path / ".trash" / "restic-restore.md").write_text("# Old\nrestic restore archive\n")
     policy = notes_context(paths=[str(tmp_path)], min_score=0.1)
     assert await policy(_event("restic restore of the archive")) is None
+
+
+async def test_notes_context_shows_paths_where_the_agent_can_open_them(tmp_path: Path) -> None:
+    """The server's copy of the notes is not where the agent's host keeps them."""
+    from omnigent.policies.builtins.context import notes_context
+
+    _write_notes(tmp_path)
+    policy = notes_context(
+        paths=[str(tmp_path)],
+        min_score=1.0,
+        show_paths_as={str(tmp_path): "~/notes", str(tmp_path / "questions"): "~/questions"},
+    )
+    result = await policy(_event("how long would a restic restore of the archive take?"))
+    assert result is not None
+    # The longest matching prefix wins.
+    assert result["context"].splitlines()[1] == (
+        "- ~/questions/backup-restore.md — How long does a restic restore of the archive take?"
+    )
+
+
+async def test_notes_context_keeps_paths_outside_the_mapping(tmp_path: Path) -> None:
+    from omnigent.policies.builtins.context import notes_context
+
+    _write_notes(tmp_path)
+    policy = notes_context(
+        paths=[str(tmp_path)],
+        min_score=1.0,
+        show_paths_as={str(tmp_path / "quest"): "~/wrong"},
+    )
+    result = await policy(_event("how long would a restic restore of the archive take?"))
+    assert result is not None
+    # A prefix only matches whole folder names: "quest" is not "questions".
+    assert result["context"].splitlines()[1].startswith(f"- {tmp_path / 'questions'}/")
